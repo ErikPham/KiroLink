@@ -1,0 +1,75 @@
+{
+  "request": {
+    "conversation_id": "recorded",
+    "user_input_message": {
+      "content": "[REDACTED_TEXT chars=181]",
+      "user_input_message_context": {
+        "env_state": {
+          "operating_system": "macos",
+          "current_working_directory": "/Users/erik/workspace/lab/js/kiro-proxy",
+          "environment_variables": []
+        },
+        "git_state": null,
+        "tool_results": null,
+        "tools": [
+          {
+            "ToolSpecification": {
+              "name": "code",
+              "description": "Code intelligence with AST parsing and fuzzy search.",
+              "input_schema": {
+                "json": {
+                  "type": "object",
+                  "required": ["operation"]
+                }
+              }
+            }
+          }
+        ]
+      },
+      "user_intent": null,
+      "images": null,
+      "model_id": "auto"
+    },
+    "history": [
+      {
+        "UserInputMessage": {
+          "content": "[REDACTED_TEXT chars=5994]",
+          "user_input_message_context": null,
+          "user_intent": null,
+          "images": null,
+          "model_id": null
+        }
+      },
+      {
+        "AssistantResponseMessage": {
+          "message_id": null,
+          "content": "[REDACTED_TEXT chars=154]",
+          "tool_uses": null
+        }
+      }
+    ],
+    "agent_continuation_id": null
+  },
+  "responses": [
+    {
+      "kind": "AssistantResponseEvent",
+      "data": {
+        "content": "OK"
+      }
+    },
+    {
+      "kind": "ContextUsageEvent",
+      "data": {
+        "context_usage_percentage": 1.7224001
+      }
+    },
+    {
+      "kind": "MeteringEvent",
+      "data": {
+        "usage": 0.054700628192371474,
+        "unit": "credit",
+        "unit_plural": "credits"
+      }
+    }
+  ]
+}

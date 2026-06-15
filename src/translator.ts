@@ -1,0 +1,493 @@
+import { randomUUID } from 'node:crypto'
+import type { KiroPayload, KiroToolUse } from './kiro-api'
+import { InvalidRequestError } from './errors'
+
+export type AnthropicContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: string; media_type: string; data: string } }
+  | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+  | { type: 'tool_result'; tool_use_id: string; content: unknown }
+  | { type: 'thinking'; thinking: string }
+  | { type: string; [key: string]: unknown }
+
+export type AnthropicMessage = { role: 'user' | 'assistant'; content: string | AnthropicContentBlock[] }
+
+export type AnthropicRequest = {
+  model: string
+  max_tokens?: number
+  stream?: boolean
+  thinking?: { type: string; budget_tokens?: number }
+  system?: string | { type: string; text: string }[]
+  messages?: AnthropicMessage[]
+  tools?: { name: string; description: string; input_schema: unknown }[]
+}
+
+const TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/u
+const TOOL_USE_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/u
+const MODEL_ID_PATTERN = /^claude-(?:opus|sonnet|haiku)-\d+(?:\.\d+)?$/u
+const DEFAULT_MAX_TOOLS = 256
+const DEFAULT_MAX_TOOL_SCHEMA_BYTES = 128 * 1024
+const DEFAULT_MAX_TOTAL_TOOL_SCHEMA_BYTES = 768 * 1024
+const MAX_TOOL_RESULT_TEXT_BYTES = 128 * 1024
+const MAX_OUTPUT_TOKENS = 100_000
+const MAX_IMAGES = 20
+const IMAGE_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
+const EFFORT_MODELS = new Set(['claude-opus-4.7', 'claude-opus-4.6', 'claude-sonnet-4.6'])
+
+// Fallback only. Prefer additionalModelRequestFields; prompt injection is opt-in.
+const THINKING_PROMPT = 'enabled 200000'
+
+// kiro-cli sends origin "KIRO_CLI" (not "AI_EDITOR" which is the IDE)
+const KIRO_ORIGIN = 'KIRO_CLI'
+
+function buildEnvState(): Record<string, string> {
+  const os = process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux'
+  return { operatingSystem: os, currentWorkingDirectory: process.cwd() }
+}
+
+export function anthropicToKiro(req: AnthropicRequest): KiroPayload {
+  const messages = validateAnthropicRequest(req)
+  const modelId = mapModelId(req.model)
+  const maxTokens = validateMaxTokens(req.max_tokens)
+  const systemText = extractSystem(req.system)
+  const thinking = req.thinking?.type === 'enabled' || req.thinking?.type === 'adaptive'
+  const filtered = filterSystemPrompt(systemText)
+  const effectiveSystem = thinking && shouldInjectThinkingPrompt() ? `${THINKING_PROMPT}\n\n${filtered}` : filtered
+  const { specs: tools, responseNameMap: toolNameMap, requestNameMap } = buildToolSpecs(req.tools ?? [], 'Anthropic')
+  const seenToolUseIds = new Set<string>()
+
+  // Flatten messages into alternating user/assistant for Kiro history
+  // Claude Code sends: user, assistant(tool_use), user(tool_result), assistant, ...
+  // Kiro expects: strict alternating userInputMessage / assistantResponseMessage
+  const flat: { role: 'user' | 'assistant'; text: string; images: unknown[]; toolUses: KiroToolUse[]; toolResults: unknown[] }[] = []
+
+  for (const msg of messages) {
+    const text = extractText(msg.content)
+    const images = msg.role === 'user' ? extractImages(msg.content) : []
+    const toolUses = msg.role === 'assistant' ? extractToolUses(msg.content, seenToolUseIds, requestNameMap) : []
+    const toolResults = msg.role === 'user' ? extractToolResults(msg.content, seenToolUseIds, 'Anthropic') : []
+
+    // Merge consecutive same-role messages
+    const last = flat[flat.length - 1]
+    if (last && last.role === msg.role) {
+      if (text) last.text += '\n' + text
+      last.images.push(...images)
+      last.toolUses.push(...toolUses)
+      last.toolResults.push(...toolResults)
+    } else {
+      flat.push({ role: msg.role, text, images, toolUses, toolResults })
+    }
+  }
+
+  // Build history from all except last entry
+  const history: unknown[] = []
+  for (let i = 0; i < flat.length - 1; i++) {
+    const entry = flat[i]!
+    if (entry.role === 'user') {
+      const content = i === 0 && effectiveSystem ? `${effectiveSystem}\n\n${entry.text}` : entry.text
+      const ctx: Record<string, unknown> = { envState: buildEnvState() }
+      if (entry.toolResults.length) ctx['toolResults'] = entry.toolResults
+      const uim: Record<string, unknown> = { content: content || 'Continue.', userInputMessageContext: ctx, origin: KIRO_ORIGIN, modelId }
+      if (entry.images.length) uim['images'] = entry.images
+      history.push({ userInputMessage: uim })
+    } else {
+      history.push({ assistantResponseMessage: { content: entry.text, toolUses: entry.toolUses } })
+    }
+  }
+
+  // Last entry = current message
+  const last = flat[flat.length - 1]
+  const userContent = last?.role === 'user' ? last.text : ''
+  const currentImages = last?.role === 'user' ? last.images : []
+  const lastToolResults = last?.role === 'user' ? last.toolResults : []
+  const fullContent = (flat.length === 1 || flat[0]?.role !== 'user') && effectiveSystem
+    ? `${effectiveSystem}\n\n${userContent}`
+    : userContent || 'Continue.'
+
+  const userMsgCtx: Record<string, unknown> = { envState: buildEnvState() }
+  if (tools.length) userMsgCtx['tools'] = tools
+  if (lastToolResults.length) userMsgCtx['toolResults'] = lastToolResults
+
+  const currentUim: Record<string, unknown> = { content: fullContent, userInputMessageContext: userMsgCtx, origin: KIRO_ORIGIN, modelId }
+  if (currentImages.length) currentUim['images'] = currentImages
+
+  return {
+    conversationState: {
+      conversationId: stableConversationId(),
+      history,
+      currentMessage: { userInputMessage: currentUim },
+      chatTriggerType: 'MANUAL',
+    },
+    profileArn: '',
+    agentMode: 'VIBE',
+    additionalModelRequestFields: buildAdditionalModelRequestFields(modelId, req.thinking),
+    inferenceConfig: maxTokens ? { maxTokens } : undefined,
+    toolNameMap: toolNameMap.size > 0 ? toolNameMap : undefined,
+  }
+}
+
+function stableConversationId(): string { return randomUUID() }
+
+function mapModelId(model: string): string {
+  if (typeof model !== 'string' || !model) throw new InvalidRequestError('model is required')
+  let id = model.replace(/\[1m\]$/u, '').replace(/-\d{8}$/u, '')
+  id = id.replace(/^(claude-(?:opus|sonnet|haiku)-\d+)-(\d+)$/u, '$1.$2')
+  if (!MODEL_ID_PATTERN.test(id)) throw new InvalidRequestError(`Unsupported model id: ${model}`)
+  return id
+}
+
+function extractSystem(system: AnthropicRequest['system']): string {
+  if (!system) return ''
+  if (typeof system === 'string') return system
+  return system.map((b) => b.text).filter(Boolean).join('\n')
+}
+
+const CLAUDE_CODE_MARKERS = [
+  'you are an interactive agent',
+  '# doing tasks',
+  '# using your tools',
+  '# tone and style',
+  'claude code',
+]
+
+const COMPACT_SYSTEM = `You are a coding assistant. Be concise and actionable. Use tools when available. Follow the user's instructions precisely.`
+
+/** Optionally strip Claude Code's bloated system prompt. Default preserves client behavior. */
+function filterSystemPrompt(system: string): string {
+  if (!system || process.env['KIRO_PROXY_FILTER_SYSTEM_PROMPT'] !== '1' || process.env['KIRO_PROXY_NO_PROMPT_FILTER'] === '1') return system
+  const lower = system.toLowerCase()
+  let matches = 0
+  for (const marker of CLAUDE_CODE_MARKERS) {
+    if (lower.includes(marker)) matches++
+  }
+  // If ≥2 markers match, it's Claude Code's system prompt → replace
+  if (matches >= 2) return COMPACT_SYSTEM
+  return system
+}
+
+function extractText(content: string | AnthropicContentBlock[]): string {
+  if (typeof content === 'string') return content
+  return content.filter((b): b is { type: 'text'; text: string } => b.type === 'text').map((b) => b.text).join('\n')
+}
+
+function extractImages(content: string | AnthropicContentBlock[]): unknown[] {
+  if (typeof content === 'string') return []
+  const imageBlocks = content.filter((b) => b.type === 'image' && 'source' in b)
+  if (imageBlocks.length > MAX_IMAGES) throw new InvalidRequestError(`image count exceeds ${MAX_IMAGES}`)
+
+  return imageBlocks.map((b) => {
+    const src = (b as { source: { type?: string; media_type: string; data: string } }).source
+    if (src.type && src.type !== 'base64') throw new InvalidRequestError('only base64 image sources are supported')
+    if (!IMAGE_MEDIA_TYPES.has(src.media_type)) throw new InvalidRequestError(`unsupported image media type: ${src.media_type}`)
+    if (typeof src.data !== 'string' || !isLikelyBase64(src.data)) throw new InvalidRequestError('image source must be base64 data')
+    const format = src.media_type === 'image/jpeg' ? 'jpeg' : src.media_type.split('/')[1] || 'png'
+    return { format, source: { bytes: src.data } }
+  })
+}
+
+function extractToolUses(content: string | AnthropicContentBlock[], seenToolUseIds: Set<string>, requestNameMap: Map<string, string>): KiroToolUse[] {
+  if (typeof content === 'string') return []
+  return content.filter((b) => b.type === 'tool_use').map((b) => {
+    const block = b as { id: string; name: string; input: Record<string, unknown> }
+    validateToolUseId(block.id, 'Anthropic tool_use')
+    if (seenToolUseIds.has(block.id)) throw new InvalidRequestError(`Anthropic tool_use id is duplicated: ${block.id}`)
+    seenToolUseIds.add(block.id)
+    const name = requestNameMap.get(block.name) ?? validateToolName(block.name, 'Anthropic tool_use')
+    if (!isRecord(block.input)) throw new InvalidRequestError(`Anthropic tool_use input must be an object: ${block.id}`)
+    return { toolUseId: block.id, name, input: block.input }
+  })
+}
+
+function extractToolResults(content: string | AnthropicContentBlock[] | undefined, seenToolUseIds: Set<string>, source: string): unknown[] {
+  if (!content || typeof content === 'string') return []
+  return content.filter((b) => b.type === 'tool_result').map((b) => {
+    const tr = b as { tool_use_id: string; content: unknown }
+    validateKnownToolResultId(tr.tool_use_id, seenToolUseIds, source)
+    return { toolUseId: tr.tool_use_id, content: [{ text: stringifyToolResultContent(tr.content, source) }], status: 'success' }
+  })
+}
+
+export function buildAnthropicResponse(model: string, contentBlocks: AnthropicContentBlock[], inputTokens: number, outputTokens: number): unknown {
+  const hasToolUse = contentBlocks.some((b) => b.type === 'tool_use')
+  return { id: `msg_${randomUUID().replace(/-/gu, '')}`, type: 'message', role: 'assistant', content: contentBlocks, model, stop_reason: hasToolUse ? 'tool_use' : 'end_turn', stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: outputTokens } }
+}
+
+// --- OpenAI types ---
+
+export type OpenAIMessage = {
+  role: 'system' | 'user' | 'assistant' | 'tool'
+  content?: string | null
+  name?: string
+  tool_calls?: { id: string; type: string; function: { name: string; arguments: string } }[]
+  tool_call_id?: string
+}
+
+export type OpenAIRequest = {
+  model: string
+  messages: OpenAIMessage[]
+  max_tokens?: number
+  reasoning_effort?: string
+  stream?: boolean
+  tools?: { type: string; function: { name: string; description: string; parameters: unknown } }[]
+}
+
+export function openaiToKiro(req: OpenAIRequest): KiroPayload {
+  const inputMessages = validateOpenAIRequest(req)
+  const modelId = mapModelId(req.model)
+  const maxTokens = validateMaxTokens(req.max_tokens)
+  const history: unknown[] = []
+  const seenToolUseIds = new Set<string>()
+  const { specs: tools, responseNameMap: toolNameMap, requestNameMap } = buildToolSpecs((req.tools ?? []).map((t) => ({ name: t.function.name, description: t.function.description, input_schema: t.function.parameters })), 'OpenAI')
+
+  // Separate system from conversation
+  let systemText = ''
+  const msgs: OpenAIMessage[] = []
+  for (const m of inputMessages) {
+    if (m.role === 'system') systemText += (m.content ?? '') + '\n'
+    else msgs.push(m)
+  }
+
+  const flat: { role: 'user' | 'assistant'; text: string; toolUses: KiroToolUse[]; toolResults: unknown[] }[] = []
+  for (const m of msgs) {
+    let entry: { role: 'user' | 'assistant'; text: string; toolUses: KiroToolUse[]; toolResults: unknown[] } | undefined
+    if (m.role === 'user') {
+      entry = { role: 'user', text: m.content ?? '', toolUses: [], toolResults: [] }
+    } else if (m.role === 'assistant') {
+      entry = { role: 'assistant', text: m.content ?? '', toolUses: extractOpenAIToolUses(m.tool_calls ?? [], seenToolUseIds, requestNameMap), toolResults: [] }
+    } else if (m.role === 'tool') {
+      validateKnownToolResultId(m.tool_call_id, seenToolUseIds, 'OpenAI')
+      entry = { role: 'user', text: 'Here are the tool results.', toolUses: [], toolResults: [{ toolUseId: m.tool_call_id, content: [{ text: stringifyToolResultContent(m.content ?? '', 'OpenAI') }], status: 'success' }] }
+    }
+
+    if (!entry) continue
+    const last = flat[flat.length - 1]
+    const canMerge = last && last.role === entry.role && (last.toolResults.length === 0) === (entry.toolResults.length === 0)
+    if (canMerge) {
+      if (entry.text) last.text += last.text ? `\n${entry.text}` : entry.text
+      last.toolUses.push(...entry.toolUses)
+      last.toolResults.push(...entry.toolResults)
+    } else {
+      flat.push(entry)
+    }
+  }
+
+  // Build history (all except the current turn)
+  for (let i = 0; i < flat.length - 1; i++) {
+    const entry = flat[i]!
+    if (entry.role === 'user') {
+      const ctx: Record<string, unknown> = { envState: buildEnvState() }
+      if (entry.toolResults.length) ctx['toolResults'] = entry.toolResults
+      history.push({ userInputMessage: { content: entry.text || 'Continue.', userInputMessageContext: ctx, origin: KIRO_ORIGIN, modelId } })
+    } else {
+      history.push({ assistantResponseMessage: { content: entry.text, toolUses: entry.toolUses } })
+    }
+  }
+
+  const last = flat[flat.length - 1]
+  const userContent = last?.role === 'user' ? last.text : ''
+  const toolResults = last?.role === 'user' ? last.toolResults : []
+  if (!last) throw new InvalidRequestError('OpenAI messages must include at least one non-system message')
+
+  const thinking = !!req.reasoning_effort
+  const effectiveSystem = thinking && shouldInjectThinkingPrompt() ? `${THINKING_PROMPT}\n\n${systemText.trim()}` : systemText.trim()
+  const fullContent = effectiveSystem ? `${effectiveSystem}\n\n${userContent || 'Continue.'}` : userContent || 'Continue.'
+  const userMsgCtx: Record<string, unknown> = { envState: buildEnvState() }
+  if (tools.length) userMsgCtx['tools'] = tools
+  if (toolResults.length) userMsgCtx['toolResults'] = toolResults
+
+  return {
+    conversationState: {
+      conversationId: stableConversationId(),
+      history,
+      currentMessage: { userInputMessage: { content: fullContent, userInputMessageContext: userMsgCtx, origin: KIRO_ORIGIN, modelId } },
+      chatTriggerType: 'MANUAL',
+    },
+    profileArn: '',
+    agentMode: 'VIBE',
+    additionalModelRequestFields: buildAdditionalModelRequestFields(modelId, req.reasoning_effort ? { type: 'enabled', budget_tokens: effortBudget(req.reasoning_effort) } : undefined),
+    inferenceConfig: maxTokens ? { maxTokens } : undefined,
+    toolNameMap: toolNameMap.size > 0 ? toolNameMap : undefined,
+  }
+}
+
+function buildToolSpecs(tools: { name: string; description: string; input_schema: unknown }[], source: string): { specs: unknown[]; responseNameMap: Map<string, string>; requestNameMap: Map<string, string> } {
+  const maxTools = readPositiveLimit('KIRO_PROXY_MAX_TOOLS', DEFAULT_MAX_TOOLS)
+  const maxToolSchemaBytes = readPositiveLimit('KIRO_PROXY_MAX_TOOL_SCHEMA_BYTES', DEFAULT_MAX_TOOL_SCHEMA_BYTES)
+  const maxTotalToolSchemaBytes = readPositiveLimit('KIRO_PROXY_MAX_TOTAL_TOOL_SCHEMA_BYTES', DEFAULT_MAX_TOTAL_TOOL_SCHEMA_BYTES)
+
+  if (tools.length > maxTools) throw new InvalidRequestError(`${source} tool count exceeds ${maxTools}`)
+
+  const names = new Set<string>()
+  const responseNameMap = new Map<string, string>() // sanitized → original
+  const requestNameMap = new Map<string, string>() // original → sanitized
+  const originalNames = new Set<string>()
+  let totalSchemaBytes = 0
+  const specs = tools.map((t) => {
+    if (originalNames.has(t.name)) throw new InvalidRequestError(`${source} tool name is duplicated: ${t.name}`)
+    originalNames.add(t.name)
+    const sanitized = validateToolName(t.name, `${source} tool`)
+    if (names.has(sanitized)) {
+      // Deduplicate by appending index
+      let deduped = sanitized
+      let idx = 2
+      while (names.has(deduped)) { deduped = `${sanitized.slice(0, 60)}_${idx}`; idx++ }
+      names.add(deduped)
+      responseNameMap.set(deduped, t.name)
+      requestNameMap.set(t.name, deduped)
+      const schemaBytes = Buffer.byteLength(JSON.stringify(t.input_schema ?? {}))
+      if (schemaBytes > maxToolSchemaBytes) throw new InvalidRequestError(`${source} tool schema is too large: ${t.name}`)
+      totalSchemaBytes += schemaBytes
+      if (totalSchemaBytes > maxTotalToolSchemaBytes) throw new InvalidRequestError(`${source} tool schemas are too large`)
+      return { toolSpecification: { name: deduped, description: t.description, inputSchema: { json: t.input_schema } } }
+    }
+    names.add(sanitized)
+    if (sanitized !== t.name) responseNameMap.set(sanitized, t.name)
+    requestNameMap.set(t.name, sanitized)
+
+    const schemaBytes = Buffer.byteLength(JSON.stringify(t.input_schema ?? {}))
+    if (schemaBytes > maxToolSchemaBytes) throw new InvalidRequestError(`${source} tool schema is too large: ${t.name}`)
+    totalSchemaBytes += schemaBytes
+    if (totalSchemaBytes > maxTotalToolSchemaBytes) throw new InvalidRequestError(`${source} tool schemas are too large`)
+
+    return { toolSpecification: { name: sanitized, description: t.description, inputSchema: { json: t.input_schema } } }
+  })
+  return { specs, responseNameMap, requestNameMap }
+}
+
+function buildAdditionalModelRequestFields(modelId: string, thinking: AnthropicRequest['thinking']): Record<string, unknown> | undefined {
+  if (!thinking || (thinking.type !== 'enabled' && thinking.type !== 'adaptive')) return undefined
+  if (!EFFORT_MODELS.has(modelId) && process.env['KIRO_PROXY_FORCE_THINKING_EFFORT'] !== '1') return undefined
+  return { output_config: { effort: effortFromThinking(thinking) } }
+}
+
+function effortFromThinking(thinking: AnthropicRequest['thinking']): string {
+  const override = process.env['KIRO_PROXY_THINKING_EFFORT']
+  if (override) return normalizeEffort(override)
+  const budget = thinking?.budget_tokens ?? 0
+  if (budget >= 64_000) return 'max'
+  if (budget >= 32_000) return 'xhigh'
+  if (budget >= 12_000) return 'high'
+  if (budget >= 4_000) return 'medium'
+  return 'low'
+}
+
+function effortBudget(effort: string): number {
+  switch (normalizeEffort(effort)) {
+    case 'max': return 64_000
+    case 'xhigh': return 32_000
+    case 'high': return 12_000
+    case 'medium': return 4_000
+    default: return 1_024
+  }
+}
+
+function normalizeEffort(value: string): string {
+  const normalized = value.toLowerCase()
+  if (normalized === 'minimal') return 'low'
+  if (normalized === 'low' || normalized === 'medium' || normalized === 'high' || normalized === 'xhigh' || normalized === 'max') return normalized
+  throw new InvalidRequestError(`Unsupported thinking effort: ${value}`)
+}
+
+function shouldInjectThinkingPrompt(): boolean {
+  return process.env['KIRO_PROXY_INJECT_THINKING_PROMPT'] === '1'
+}
+
+function readPositiveLimit(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (!raw) return fallback
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value <= 0) throw new InvalidRequestError(`${name} must be a positive integer`)
+  return value
+}
+
+
+function validateAnthropicRequest(req: AnthropicRequest): AnthropicMessage[] {
+  if (!Array.isArray(req.messages) || req.messages.length === 0) throw new InvalidRequestError('messages must be a non-empty array')
+  for (const msg of req.messages) {
+    if (msg.role !== 'user' && msg.role !== 'assistant') throw new InvalidRequestError(`unsupported Anthropic message role: ${String((msg as { role?: unknown }).role)}`)
+    if (typeof msg.content !== 'string' && !Array.isArray(msg.content)) throw new InvalidRequestError('Anthropic message content must be a string or content block array')
+  }
+  return req.messages
+}
+
+function validateOpenAIRequest(req: OpenAIRequest): OpenAIMessage[] {
+  if (!Array.isArray(req.messages) || req.messages.length === 0) throw new InvalidRequestError('messages must be a non-empty array')
+  for (const msg of req.messages) {
+    if (msg.role !== 'system' && msg.role !== 'user' && msg.role !== 'assistant' && msg.role !== 'tool') throw new InvalidRequestError(`unsupported OpenAI message role: ${String((msg as { role?: unknown }).role)}`)
+    if (msg.role === 'tool' && !msg.tool_call_id) throw new InvalidRequestError('OpenAI tool message is missing tool_call_id')
+  }
+  return req.messages
+}
+
+function validateMaxTokens(maxTokens: number | undefined): number | undefined {
+  if (maxTokens === undefined) return undefined
+  if (!Number.isSafeInteger(maxTokens) || maxTokens <= 0 || maxTokens > MAX_OUTPUT_TOKENS) throw new InvalidRequestError(`max_tokens must be an integer from 1 to ${MAX_OUTPUT_TOKENS}`)
+  return maxTokens
+}
+
+function validateToolName(name: string, _source: string): string {
+  if (typeof name !== 'string' || !name) return 'tool'
+  if (TOOL_NAME_PATTERN.test(name)) return name
+  return sanitizeToolName(name)
+}
+
+function sanitizeToolName(name: string): string {
+  // mcp__server__tool_name → mcp-server-tool_name (shorten namespace)
+  let clean = name
+  // Collapse double underscores (MCP namespace separator)
+  if (clean.includes('__')) {
+    const parts = clean.split('__')
+    clean = parts.length > 2 ? `${parts[0]}_${parts[parts.length - 1]!}` : parts.join('_')
+  }
+  // Remove invalid chars
+  clean = clean.replace(/[^A-Za-z0-9_-]/gu, '_')
+  // Truncate to 64
+  if (clean.length > 64) clean = clean.slice(0, 64)
+  return clean || 'tool'
+}
+
+function validateToolUseId(id: string | undefined, source: string): asserts id is string {
+  if (typeof id !== 'string' || !TOOL_USE_ID_PATTERN.test(id)) throw new InvalidRequestError(`${source} id is invalid: ${String(id)}`)
+}
+
+function validateKnownToolResultId(id: string | undefined, seenToolUseIds: Set<string>, source: string): void {
+  validateToolUseId(id, `${source} tool_result`)
+  if (!seenToolUseIds.has(id)) throw new InvalidRequestError(`${source} tool_result references an unknown tool_use id: ${id}`)
+}
+
+function extractOpenAIToolUses(toolCalls: NonNullable<OpenAIMessage['tool_calls']>, seenToolUseIds: Set<string>, requestNameMap: Map<string, string>): KiroToolUse[] {
+  return toolCalls.map((tc) => {
+    validateToolUseId(tc.id, 'OpenAI tool_call')
+    if (seenToolUseIds.has(tc.id)) throw new InvalidRequestError(`OpenAI tool_call id is duplicated: ${tc.id}`)
+    seenToolUseIds.add(tc.id)
+    const name = requestNameMap.get(tc.function.name) ?? validateToolName(tc.function.name, 'OpenAI tool_call')
+    return { toolUseId: tc.id, name, input: parseToolInput(tc.function.arguments, tc.id) }
+  })
+}
+
+function parseToolInput(value: string, id: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (!isRecord(parsed)) throw new Error('not an object')
+    return parsed
+  } catch {
+    throw new InvalidRequestError(`OpenAI tool_call arguments must be a JSON object: ${id}`)
+  }
+}
+
+function stringifyToolResultContent(content: unknown, source: string): string {
+  const text = typeof content === 'string' ? content : JSON.stringify(content)
+  if (typeof text !== 'string') throw new InvalidRequestError(`${source} tool_result content is not serializable`)
+  if (Buffer.byteLength(text) > MAX_TOOL_RESULT_TEXT_BYTES) throw new InvalidRequestError(`${source} tool_result content is too large`)
+  return text
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isLikelyBase64(value: string): boolean {
+  if (!value) return false
+  if (value.startsWith('data:')) return false
+  return /^[A-Za-z0-9+/]+={0,2}$/u.test(value)
+}

@@ -1,0 +1,59 @@
+{
+  "name": "kirolink",
+  "version": "1.0.0",
+  "description": "Anthropic & OpenAI compatible proxy backed by Kiro. Works with Claude Code and Codex.",
+  "type": "module",
+  "packageManager": "pnpm@10.12.1",
+  "bin": {
+    "kirolink": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup && printf '#!/usr/bin/env node\\n' | cat - dist/index.js > dist/tmp && mv dist/tmp dist/index.js && chmod +x dist/index.js",
+    "dev": "pnpm build && node dist/index.js",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "runtime:analyze": "node scripts/analyze-runtime-recording.mjs",
+    "runtime:probe": "node scripts/probe-runtime-shapes.mjs",
+    "runtime:record": "node scripts/record-runtime.mjs",
+    "runtime:roundtrip": "node scripts/smoke-runtime-proxy.mjs --roundtrip --tools 1",
+    "runtime:smoke": "node scripts/smoke-runtime-proxy.mjs",
+    "release:check": "node scripts/release-check.mjs",
+    "release:notes": "node scripts/render-release-notes.mjs",
+    "release:prepare": "node scripts/prepare-release.mjs",
+    "prepublishOnly": "pnpm build"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "kiro",
+    "claude",
+    "anthropic",
+    "openai",
+    "codex",
+    "proxy",
+    "claude-code"
+  ],
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/ErikPham/KiroLink#readme",
+  "bugs": {
+    "url": "https://github.com/ErikPham/KiroLink/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ErikPham/KiroLink"
+  }
+}
