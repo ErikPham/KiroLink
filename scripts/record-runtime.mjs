@@ -11,6 +11,7 @@ const MAX_LOG_BYTES = 64 * 1024
 
 function usage() {
   process.stdout.write(`Usage: pnpm run runtime:record -- [options]
+       pnpm run runtime:record -- [options] -- <kiro-cli args...>
 
 Records a real Kiro CLI runtime request using KIRO_RECORD_API_REQUESTS_PATH and
 KIRO_RECORD_API_RESPONSES_PATH, then writes sanitized copies for inspection.
@@ -22,28 +23,36 @@ Options:
   --cli <path>      Kiro CLI binary path (default: KIRO_CLI_BIN or app bundle path)
   -h, --help        Show this help
 
+If you pass args after a literal -- separator, they are forwarded to kiro-cli
+exactly as given and replace the default text-only chat invocation.
+
 Raw files may contain prompts, tool output, and auth metadata. Inspect the
 *.sanitized.jsonl files first and delete raw files when done.
 `)
 }
 
 function parseArgs(argv) {
+  const normalizedArgv = argv[0] === '--' ? argv.slice(1) : argv
   const options = {
     outDir: undefined,
     prompt: DEFAULT_PROMPT,
     model: undefined,
     cli: process.env.KIRO_CLI_BIN || (existsSync(DEFAULT_KIRO_CLI) ? DEFAULT_KIRO_CLI : 'kiro-cli'),
+    cliArgs: undefined,
   }
 
   const readValue = (arg, index) => {
-    const value = argv[index + 1]
+    const value = normalizedArgv[index + 1]
     if (!value || value.startsWith('-')) throw new Error(`${arg} requires a value`)
     return value
   }
 
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i]
-    if (arg === '--') continue
+  for (let i = 0; i < normalizedArgv.length; i++) {
+    const arg = normalizedArgv[i]
+    if (arg === '--') {
+      options.cliArgs = normalizedArgv.slice(i + 1)
+      break
+    }
     if (arg === '-h' || arg === '--help') return { help: true, options }
     if (arg === '--out') options.outDir = readValue(arg, i++)
     else if (arg === '--prompt') options.prompt = readValue(arg, i++)
@@ -147,9 +156,13 @@ async function main() {
   const requestsSanitized = join(outDir, 'requests.sanitized.jsonl')
   const responsesSanitized = join(outDir, 'responses.sanitized.jsonl')
 
-  const args = ['chat', '--no-interactive', '--agent-engine', 'v2', '--trust-tools=', '--wrap', 'never']
-  if (options.model) args.push('--model', options.model)
-  args.push(options.prompt)
+  const args = options.cliArgs
+    ? [...options.cliArgs]
+    : ['chat', '--no-interactive', '--agent-engine', 'v2', '--trust-tools=', '--wrap', 'never']
+  if (!options.cliArgs) {
+    if (options.model) args.push('--model', options.model)
+    args.push(options.prompt)
+  }
 
   const env = {
     ...process.env,

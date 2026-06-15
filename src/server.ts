@@ -36,14 +36,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: ProxyCo
     if (req.method === 'POST' && path === '/v1/messages') {
       const request = await body<AnthropicRequest>(req, config.maxBodyBytes)
       log(`  → model=${request.model} stream=${request.stream} tools=${request.tools?.length ?? 0}`)
-      await handleMessages(res, request, log)
+      const ac = new AbortController(); req.on('close', () => ac.abort()); await handleMessages(res, request, log, ac.signal)
       return
     }
 
     if (req.method === 'POST' && path === '/v1/chat/completions') {
       const request = await body<OpenAIRequest>(req, config.maxBodyBytes)
       log(`  → model=${request.model} stream=${request.stream} tools=${request.tools?.length ?? 0}`)
-      await handleOpenAI(res, request, log)
+      const ac2 = new AbortController(); req.on('close', () => ac2.abort()); await handleOpenAI(res, request, log, ac2.signal)
       return
     }
     json(res, 404, { error: { type: 'not_found_error', message: 'Not found' } })
@@ -58,7 +58,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: ProxyCo
   }
 }
 
-async function handleMessages(res: ServerResponse, request: AnthropicRequest, log: (msg: string) => void): Promise<void> {
+async function handleMessages(res: ServerResponse, request: AnthropicRequest, log: (msg: string) => void, signal: AbortSignal): Promise<void> {
   const model = request.model
   const payload = anthropicToKiro(request)
 
@@ -92,7 +92,7 @@ async function handleMessages(res: ServerResponse, request: AnthropicRequest, lo
           break
         case 'done': inTok = ev.inputTokens; outTok = ev.outputTokens; break
       }
-    }))
+    }, signal))
 
     if (inText || inThink) closeBlock()
     sse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: hasToolUse ? 'tool_use' : 'end_turn', stop_sequence: null }, usage: { output_tokens: outTok } })
@@ -112,7 +112,7 @@ async function handleMessages(res: ServerResponse, request: AnthropicRequest, lo
       case 'tool_use': if (textBuf) { blocks.push({ type: 'text', text: textBuf }); textBuf = '' }; blocks.push({ type: 'tool_use', id: ev.toolUse.toolUseId, name: ev.toolUse.name, input: ev.toolUse.input }); break
       case 'done': inTok = ev.inputTokens; outTok = ev.outputTokens; break
     }
-  }))
+  }, signal))
   if (thinkBuf) blocks.unshift({ type: 'thinking', thinking: thinkBuf })
   if (textBuf) blocks.push({ type: 'text', text: textBuf })
   if (!blocks.length) blocks.push({ type: 'text', text: '' })
@@ -210,7 +210,7 @@ function errorTypeForError(error: unknown): string {
   return 'api_error'
 }
 
-async function handleOpenAI(res: ServerResponse, request: OpenAIRequest, log: (msg: string) => void): Promise<void> {
+async function handleOpenAI(res: ServerResponse, request: OpenAIRequest, log: (msg: string) => void, signal: AbortSignal): Promise<void> {
   const model = request.model
   const payload = openaiToKiro(request)
   const chatId = `chatcmpl-${randomUUID()}`
@@ -238,7 +238,7 @@ async function handleOpenAI(res: ServerResponse, request: OpenAIRequest, log: (m
           break
         case 'done': inTok = ev.inputTokens; outTok = ev.outputTokens; break
       }
-    }))
+    }, signal))
 
     res.write(`data: ${JSON.stringify({ id: chatId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: hasToolCalls ? 'tool_calls' : 'stop' }], usage: { prompt_tokens: inTok, completion_tokens: outTok, total_tokens: inTok + outTok } })}\n\n`)
     res.write('data: [DONE]\n\n')
@@ -258,7 +258,7 @@ async function handleOpenAI(res: ServerResponse, request: OpenAIRequest, log: (m
       case 'tool_use': toolCalls.push({ id: ev.toolUse.toolUseId, type: 'function', function: { name: ev.toolUse.name, arguments: JSON.stringify(ev.toolUse.input) } }); break
       case 'done': inTok = ev.inputTokens; outTok = ev.outputTokens; break
     }
-  }))
+  }, signal))
 
   const message: Record<string, unknown> = { role: 'assistant', content: content || null }
   if (reasoning) message['reasoning_content'] = reasoning

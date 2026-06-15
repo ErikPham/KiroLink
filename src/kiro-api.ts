@@ -96,7 +96,7 @@ function refreshTokenViaCli(): Promise<void> {
   })
 }
 
-export async function callKiroApi(payload: KiroPayload, onEvent: (event: KiroStreamEvent) => void): Promise<void> {
+export async function callKiroApi(payload: KiroPayload, onEvent: (event: KiroStreamEvent) => void, signal?: AbortSignal): Promise<void> {
   // Truncate payload if too large
   truncatePayload(payload)
   const toolNameMap = payload.toolNameMap
@@ -121,6 +121,7 @@ export async function callKiroApi(payload: KiroPayload, onEvent: (event: KiroStr
     if (!token.profileArn) throw new Error('Kiro token does not contain profileArn')
 
     const resp = await new Promise<IncomingMessage>((resolve, reject) => {
+      if (signal?.aborted) { reject(new Error('Request aborted')); return }
       const url = resolveKiroApiUrl()
       const req = request({ hostname: url.hostname, port: url.port || undefined, path: `${url.pathname}${url.search}`, method: 'POST', headers: {
         'Content-Type': 'application/x-amz-json-1.0',
@@ -136,6 +137,7 @@ export async function callKiroApi(payload: KiroPayload, onEvent: (event: KiroStr
       } }, resolve)
       req.on('error', reject)
       req.setTimeout(REQUEST_TIMEOUT_MS, () => req.destroy(new Error('Kiro API request timed out')))
+      signal?.addEventListener('abort', () => req.destroy(new Error('Request aborted')), { once: true })
       req.end(body)
     })
 

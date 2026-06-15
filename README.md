@@ -145,6 +145,38 @@ This uses Kiro CLI's own `KIRO_RECORD_API_REQUESTS_PATH` and `KIRO_RECORD_API_RE
 
 The command runs `kiro-cli chat --no-interactive --agent-engine v2 --trust-tools=` with a minimal prompt. Raw `*.raw.jsonl` files may still contain prompt or auth-adjacent metadata; inspect the sanitized files first and delete raw files when done.
 
+If you need to capture a different `kiro-cli` invocation, pass the exact CLI
+args after a literal `--`. They replace the default text-only chat command:
+
+```bash
+pnpm run runtime:record -- --out .kiro-recordings/custom -- chat --help
+pnpm run runtime:record -- --out .kiro-recordings/custom -- chat --no-interactive --agent-engine v2 --trust-tools= --wrap never "Reply with exactly: OK"
+```
+
+This passthrough mode is the safest way to compare KiroLink assumptions against
+the real local CLI behavior because it records the exact command under test
+instead of reconstructing it in the proxy.
+
+For the desktop image path, use the dedicated capture harness:
+
+```bash
+pnpm run runtime:capture-image -- --image /absolute/path/to/test.png
+pnpm run runtime:capture-image -- --image /absolute/path/to/test.png --prompt "Describe the pasted image in exactly one word."
+```
+
+`runtime:capture-image` starts `mitmdump`, injects the mitm CA into the local
+Kiro desktop process, copies the image into the macOS clipboard, launches the
+desktop app through the proxy, and attempts to paste and submit the prompt via
+AppleScript. It writes parsed request and response artifacts into
+`/tmp/kiro-desktop-capture-<timestamp>` by default.
+
+Use `--manual` when you want the script to prepare the clipboard and capture
+environment but you prefer to paste the image yourself:
+
+```bash
+pnpm run runtime:capture-image -- --image /absolute/path/to/test.png --manual
+```
+
 `runtime:analyze` reports top-level request keys, message/context keys, tool schema wrappers, response event kinds, and drift warnings. Use that report before changing the proxy request body; Kiro CLI recordings may use internal snake_case wrapper names even when the service client path still uses generated service fields.
 
 To validate the actual service wire shape directly:

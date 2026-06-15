@@ -14,6 +14,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "runtime:analyze": "node scripts/analyze-runtime-recording.mjs",
+    "runtime:capture-image": "bash scripts/capture-kiro-desktop-image.sh",
     "runtime:matrix": "node scripts/runtime-matrix.mjs",
     "runtime:probe": "node scripts/probe-runtime-shapes.mjs",
     "runtime:record": "node scripts/record-runtime.mjs",
