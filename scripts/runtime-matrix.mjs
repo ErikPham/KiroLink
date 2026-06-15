@@ -12,12 +12,13 @@ summary. This consumes Kiro quota because every case hits the live runtime.
 Options:
   --model <id>      Model id (default: ${DEFAULT_MODEL})
   --full            Include a stricter all-ok probe for camel-only requests
+  --image           Include the current vision smoke case (expected to fail until fixed)
   -h, --help        Show this help
 `)
 }
 
 function parseArgs(argv) {
-  const options = { model: DEFAULT_MODEL, full: false }
+  const options = { model: DEFAULT_MODEL, full: false, image: false }
   const readValue = (arg, index) => {
     const value = argv[index + 1]
     if (!value || value.startsWith('-')) throw new Error(`${arg} requires a value`)
@@ -29,6 +30,7 @@ function parseArgs(argv) {
     if (arg === '-h' || arg === '--help') return { help: true, options }
     if (arg === '--model') options.model = readValue(arg, i++)
     else if (arg === '--full') options.full = true
+    else if (arg === '--image') options.image = true
     else throw new Error(`Unknown option: ${arg}`)
   }
   return { help: false, options }
@@ -78,11 +80,19 @@ function summarizeSmokeCase(name, json) {
       detail: `first=${json.first?.stop_reason ?? 'unknown'}, second=${json.second?.stop_reason ?? 'missing'}`,
     }
   }
+  if (json.mode === 'stream') {
+    return {
+      name,
+      ok: Boolean(json.ok) && Boolean(json.has_done) && Number(json.data_events ?? 0) > 0,
+      kind: 'smoke',
+      detail: `status=${json.status ?? 'unknown'}, api=${json.api ?? 'unknown'}, events=${json.data_events ?? 0}, done=${json.has_done ? 'yes' : 'no'}`,
+    }
+  }
   return {
     name,
     ok: Boolean(json.ok),
     kind: 'smoke',
-    detail: `status=${json.status ?? 'unknown'}, stop=${json.body?.stop_reason ?? 'unknown'}, tools=${json.tools ?? 0}`,
+    detail: `status=${json.status ?? 'unknown'}, api=${json.api ?? 'unknown'}, stop=${json.body?.stop_reason ?? json.body?.choices?.[0]?.finish_reason ?? 'unknown'}, tools=${json.tools ?? 0}`,
   }
 }
 
@@ -119,6 +129,24 @@ async function main() {
       summarize: summarizeSmokeCase,
     },
     {
+      name: 'proxy-openai-smoke',
+      script: 'scripts/smoke-runtime-proxy.mjs',
+      args: ['--api', 'openai', '--model', options.model, '--prompt', 'Reply with exactly: OK'],
+      summarize: summarizeSmokeCase,
+    },
+    {
+      name: 'proxy-anthropic-stream',
+      script: 'scripts/smoke-runtime-proxy.mjs',
+      args: ['--model', options.model, '--stream', '--prompt', 'Reply with exactly: OK'],
+      summarize: summarizeSmokeCase,
+    },
+    {
+      name: 'proxy-openai-stream',
+      script: 'scripts/smoke-runtime-proxy.mjs',
+      args: ['--api', 'openai', '--model', options.model, '--stream', '--prompt', 'Reply with exactly: OK'],
+      summarize: summarizeSmokeCase,
+    },
+    {
       name: 'proxy-roundtrip',
       script: 'scripts/smoke-runtime-proxy.mjs',
       args: ['--model', options.model, '--roundtrip', '--tools', '1'],
@@ -132,6 +160,15 @@ async function main() {
       script: 'scripts/probe-runtime-shapes.mjs',
       args: ['--shape', 'camel', '--expect', 'all-ok', '--model', options.model, '--tools', '1', '--prompt', 'Use smoke_tool_0 with value ping. Do not answer directly.'],
       summarize: summarizeProbeCase,
+    })
+  }
+
+  if (options.image) {
+    cases.push({
+      name: 'proxy-image-input',
+      script: 'scripts/smoke-runtime-proxy.mjs',
+      args: ['--model', options.model, '--image', '--prompt', 'Reply with exactly: OK after reading the image'],
+      summarize: summarizeSmokeCase,
     })
   }
 

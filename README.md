@@ -159,7 +159,8 @@ pnpm run runtime:probe -- --shape both --model claude-sonnet-4.6 --tools 1 --pro
 By default `runtime:probe` uses `--expect current`: generated service `camelCase` payloads must return `200`, while Kiro CLI recording-like `snake_case` payloads must be rejected with `400 REQUEST_BODY_INVALID`. That makes the command pass when the runtime behavior matches the known safe shape. Use `--expect all-ok` only when deliberately testing whether a rejected shape has started working.
 
 `runtime:matrix` runs the baseline probe set used by this repo: plain text,
-thinking, direct tool-use wire shape, proxy smoke with `81` tools, and a full
+thinking, direct tool-use wire shape, Anthropic/OpenAI proxy smoke, streaming
+for both API surfaces, proxy smoke with `81` tools, and a full
 `tool_use -> tool_result -> end_turn` roundtrip.
 
 To test the full proxy path against live Kiro runtime after building:
@@ -178,17 +179,22 @@ These send live requests through the local proxy and may consume Kiro quota. `ru
 | Surface | Scope | Status | Verification |
 |---------|-------|--------|--------------|
 | Claude Code | Anthropic `POST /v1/messages` | Tested live | `runtime:smoke`, `runtime:roundtrip` |
-| Codex | OpenAI `POST /v1/chat/completions` | Supported by translator, not yet in live matrix | local tests + translator path |
-| Streaming | SSE response translation | Supported | unit tests + runtime probes observe event stream |
+| Codex | OpenAI `POST /v1/chat/completions` | Tested live | `runtime:smoke --api openai` |
+| Streaming | SSE response translation for Anthropic and OpenAI | Tested live | `runtime:smoke --stream`, `runtime:smoke --api openai --stream` |
 | Thinking | `additionalModelRequestFields.output_config.effort` | Tested live | `runtime:probe --thinking` |
 | Tool use | assistant `tool_use` emission | Tested live | `runtime:probe --tools 1`, `runtime:smoke --tools 1` |
 | Tool roundtrip | `tool_use -> tool_result -> final answer` | Tested live | `runtime:roundtrip` |
 | Large tool count | Anthropic request with `81` tools | Tested live | `runtime:smoke --tools 81` |
 | Kiro CLI trace drift | snake_case trace vs camelCase wire shape | Tested live | `runtime:probe --shape both` |
-| Image input | base64 image passthrough | Implemented, not yet in live matrix | request validation + translator path |
 
 The compatibility table is intentionally narrow: entries only move to
-"Tested live" once they are covered by the runtime probe or smoke scripts.
+`Tested live` once they are covered by the runtime probe or smoke scripts.
+
+Known live gap:
+
+- Image input is implemented in the Anthropic translator and validated locally,
+  but the current live Kiro runtime path still rejects the request with `400`.
+  Keep it out of `Tested live` until the exact upstream shape is confirmed.
 
 ### Release maintenance
 

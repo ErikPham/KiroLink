@@ -6,6 +6,7 @@ import { resolve } from 'node:path'
 const DEFAULT_PROMPT = 'Reply with exactly: OK'
 const DEFAULT_ROUNDTRIP_PROMPT = 'Use smoke_tool_0 with value ping. Do not answer directly.'
 const DEFAULT_MODEL = 'claude-sonnet-4.6'
+const TEST_IMAGE_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WnRsl0AAAAASUVORK5CYII='
 
 function usage() {
   process.stdout.write(`Usage: pnpm run runtime:smoke -- [options]
@@ -14,10 +15,13 @@ Starts the built proxy locally and sends one minimal Anthropic-compatible
 request through it. This calls the live Kiro runtime and may consume quota.
 
 Options:
+  --api <name>      anthropic or openai (default: anthropic)
   --model <id>      Model id (default: ${DEFAULT_MODEL})
   --prompt <text>   Prompt (default: "${DEFAULT_PROMPT}")
   --port <port>     Local port (default: random high port)
   --tools <n>       Include n no-op Anthropic tools (default: 0)
+  --stream          Use the streaming response path
+  --image           Include a tiny inline PNG image input
   --roundtrip       Verify tool_use -> tool_result -> final answer
   --tool-result <s> Tool result text for --roundtrip (default: "tool returned: pong")
   -h, --help        Show this help
@@ -28,10 +32,13 @@ Run pnpm build first if dist/index.js does not exist.
 
 function parseArgs(argv) {
   const options = {
+    api: 'anthropic',
     model: DEFAULT_MODEL,
     prompt: DEFAULT_PROMPT,
     port: String(45000 + Math.floor(Math.random() * 1000)),
     tools: '0',
+    stream: false,
+    image: false,
     roundtrip: false,
     toolResult: 'tool returned: pong',
     promptProvided: false,
@@ -46,14 +53,18 @@ function parseArgs(argv) {
     const arg = argv[i]
     if (arg === '--') continue
     if (arg === '-h' || arg === '--help') return { help: true, options }
-    if (arg === '--model') options.model = readValue(arg, i++)
+    if (arg === '--api') options.api = readValue(arg, i++)
+    else if (arg === '--model') options.model = readValue(arg, i++)
     else if (arg === '--prompt') { options.prompt = readValue(arg, i++); options.promptProvided = true }
     else if (arg === '--port') options.port = readValue(arg, i++)
     else if (arg === '--tools') options.tools = readValue(arg, i++)
+    else if (arg === '--stream') options.stream = true
+    else if (arg === '--image') options.image = true
     else if (arg === '--roundtrip') options.roundtrip = true
     else if (arg === '--tool-result') options.toolResult = readValue(arg, i++)
     else throw new Error(`Unknown option: ${arg}`)
   }
+  if (!['anthropic', 'openai'].includes(options.api)) throw new Error('--api must be anthropic or openai')
   return { help: false, options }
 }
 
@@ -98,6 +109,40 @@ async function sendMessage(port, body) {
   return { status: res.status, ok: res.ok, body: await res.json().catch(() => null) }
 }
 
+async function sendOpenAI(port, body) {
+  const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer smoke',
+    },
+    body: JSON.stringify(body),
+  })
+  return { status: res.status, ok: res.ok, body: await res.json().catch(() => null) }
+}
+
+async function sendStreaming(path, headers, body) {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  })
+  const text = await res.text()
+  return { status: res.status, ok: res.ok, text }
+}
+
+function anthropicUserContent(prompt, includeImage) {
+  if (!includeImage) return prompt
+  return [
+    { type: 'text', text: prompt },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: TEST_IMAGE_BASE64 } },
+  ]
+}
+
+function openAIUserContent(prompt) {
+  return prompt
+}
+
 function summarizeMessageResult(result) {
   return {
     status: result.status,
@@ -108,15 +153,64 @@ function summarizeMessageResult(result) {
 }
 
 async function runSingleSmoke(options, port, tools) {
+  if (options.api === 'openai') {
+    return sendOpenAI(port, {
+      model: options.model,
+      max_tokens: 32,
+      messages: [{ role: 'user', content: openAIUserContent(options.prompt) }],
+      ...(tools.length ? { tools: tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.input_schema } })) } : {}),
+    })
+  }
   return sendMessage(port, {
     model: options.model,
     max_tokens: 32,
-    messages: [{ role: 'user', content: options.prompt }],
+    messages: [{ role: 'user', content: anthropicUserContent(options.prompt, options.image) }],
     ...(tools.length ? { tools } : {}),
   })
 }
 
+async function runStreamingSmoke(options, port, tools) {
+  if (options.api === 'openai') {
+    return sendStreaming(
+      `http://127.0.0.1:${port}/v1/chat/completions`,
+      { 'content-type': 'application/json', authorization: 'Bearer smoke' },
+      {
+        model: options.model,
+        stream: true,
+        max_tokens: 32,
+        messages: [{ role: 'user', content: openAIUserContent(options.prompt) }],
+        ...(tools.length ? { tools: tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.input_schema } })) } : {}),
+      },
+    )
+  }
+  return sendStreaming(
+    `http://127.0.0.1:${options.port}/v1/messages`,
+    { 'content-type': 'application/json', 'anthropic-version': '2023-06-01', authorization: 'Bearer smoke' },
+    {
+      model: options.model,
+      stream: true,
+      max_tokens: 32,
+      messages: [{ role: 'user', content: anthropicUserContent(options.prompt, options.image) }],
+      ...(tools.length ? { tools } : {}),
+    },
+  )
+}
+
+function summarizeStreamingResult(result, api) {
+  const lines = result.text.split('\n').filter(Boolean)
+  const dataLines = lines.filter((line) => line.startsWith('data: '))
+  return {
+    status: result.status,
+    ok: result.ok,
+    api,
+    data_events: dataLines.length,
+    has_done: api === 'openai' ? dataLines.some((line) => line === 'data: [DONE]') : lines.some((line) => line === 'event: message_stop'),
+    preview: dataLines.slice(0, 3),
+  }
+}
+
 async function runRoundtripSmoke(options, port, tools) {
+  if (options.api !== 'anthropic') throw new Error('--roundtrip currently supports --api anthropic only')
   const prompt = options.promptProvided ? options.prompt : DEFAULT_ROUNDTRIP_PROMPT
   const first = await sendMessage(port, {
     model: options.model,
@@ -159,6 +253,7 @@ async function main() {
   const toolCount = options.roundtrip && options.tools === '0' ? 1 : Number(options.tools)
   if (!Number.isSafeInteger(toolCount) || toolCount < 0) throw new Error('--tools must be a non-negative integer')
   if (options.roundtrip && toolCount < 1) throw new Error('--roundtrip requires at least one tool')
+  if (options.image && options.api !== 'anthropic') throw new Error('--image currently supports --api anthropic only')
   const tools = buildSmokeTools(toolCount)
 
   const child = spawn(process.execPath, [dist, '--host', '127.0.0.1', '--port', options.port, '--quiet'], {
@@ -175,20 +270,34 @@ async function main() {
       process.stdout.write(JSON.stringify({
         mode: 'roundtrip',
         ok: result.pass,
+        api: options.api,
         model: options.model,
         tools: toolCount,
         first: summarizeMessageResult(result.first),
         second: result.second ? summarizeMessageResult(result.second) : null,
       }, null, 2) + '\n')
       if (!result.pass) process.exitCode = 1
+    } else if (options.stream) {
+      const result = await runStreamingSmoke(options, options.port, tools)
+      const summary = summarizeStreamingResult(result, options.api)
+      process.stdout.write(JSON.stringify({
+        mode: 'stream',
+        ...summary,
+        model: options.model,
+        tools: toolCount,
+        image: options.image,
+      }, null, 2) + '\n')
+      if (!summary.ok || !summary.has_done || summary.data_events === 0) process.exitCode = 1
     } else {
       const result = await runSingleSmoke(options, options.port, tools)
       process.stdout.write(JSON.stringify({
         mode: 'single',
         status: result.status,
         ok: result.ok,
+        api: options.api,
         model: options.model,
         tools: toolCount,
+        image: options.image,
         body: result.body,
       }, null, 2) + '\n')
       if (!result.ok) process.exitCode = 1
