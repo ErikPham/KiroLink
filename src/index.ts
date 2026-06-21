@@ -2,6 +2,8 @@ import { parseArgs } from 'node:util'
 import { createKiroProxyServer } from './server'
 import { assertSafeBind, readPort, readPositiveInteger } from './config'
 
+const DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024
+
 const { values } = parseArgs({
   options: {
     port: { type: 'string', short: 'p', default: process.env['KIRO_PROXY_PORT'] ?? '4119' },
@@ -51,7 +53,7 @@ try {
   const maxConcurrent = readPositiveInteger(values['max-concurrent'], 2, 'max-concurrent')
   const delayMs = readPositiveInteger(values.delay, 200, 'delay')
   const apiKey = values['api-key']
-  const maxBodyBytes = readPositiveInteger(process.env['KIRO_PROXY_MAX_BODY_BYTES'], 1_048_576, 'KIRO_PROXY_MAX_BODY_BYTES')
+  const maxBodyBytes = readPositiveInteger(process.env['KIRO_PROXY_MAX_BODY_BYTES'], DEFAULT_MAX_BODY_BYTES, 'KIRO_PROXY_MAX_BODY_BYTES')
 
   assertSafeBind({ host, apiKey })
 

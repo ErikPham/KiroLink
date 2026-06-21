@@ -26,6 +26,7 @@ describe('anthropicToKiro', () => {
       ['claude-opus-4-8[1m]', 'claude-opus-4.8'],
       ['claude-sonnet-4-6', 'claude-sonnet-4.6'],
       ['claude-sonnet-4.5', 'claude-sonnet-4.5'],
+      ['claude-haiku-4-5-20251001', 'claude-haiku-4.5'],
       ['claude-haiku-4-20250414', 'claude-haiku-4'],
       ['claude-opus-4', 'claude-opus-4'],
     ]
@@ -170,13 +171,20 @@ describe('anthropicToKiro', () => {
     })).toThrow('tool count exceeds 256')
   })
 
-  it('passes image blocks through to Kiro user messages', () => {
+  it('synthesizes Kiro image read flow for image blocks', () => {
     const payload = anthropicToKiro({
       model: 'claude-sonnet-4.6',
       messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc' } }] }],
     })
+    expect(payload.conversationState.history).toHaveLength(2)
+    const syntheticToolUse = ((payload.conversationState.history[1] as { assistantResponseMessage: { toolUses: { name: string; input: Record<string, unknown> }[] } }).assistantResponseMessage.toolUses[0])!
+    expect(syntheticToolUse.name).toBe('fs_read')
+    expect(syntheticToolUse.input).toEqual({ operations: [{ mode: 'Image', image_paths: ['/tmp/kirolink-image-1.png'] }] })
     const msg = payload.conversationState.currentMessage.userInputMessage as Record<string, unknown>
     expect(msg['images']).toEqual([{ format: 'png', source: { bytes: 'abc' } }])
+    const ctx = msg['userInputMessageContext'] as Record<string, unknown>
+    expect(ctx['toolResults']).toHaveLength(1)
+    expect(ctx['tools']).toHaveLength(1)
   })
 
   it('extracts tool results', () => {
@@ -191,6 +199,55 @@ describe('anthropicToKiro', () => {
     const msg = payload.conversationState.currentMessage.userInputMessage as Record<string, unknown>
     const ctx = msg['userInputMessageContext'] as Record<string, unknown>
     expect(ctx['toolResults']).toHaveLength(1)
+  })
+
+  it('preserves Anthropic tool_result errors for Kiro', () => {
+    const payload = anthropicToKiro({
+      model: 'claude-sonnet-4.6',
+      messages: [
+        { role: 'user', content: 'ask' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'ask_user', input: { question: 'Pick one' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'Invalid tool parameters', is_error: true }] },
+      ],
+      tools: [{ name: 'ask_user', description: 'Ask user', input_schema: { type: 'object' } }],
+    })
+    const msg = payload.conversationState.currentMessage.userInputMessage as Record<string, unknown>
+    const ctx = msg['userInputMessageContext'] as { toolResults: { status: string }[] }
+    expect(ctx.toolResults[0]?.status).toBe('error')
+  })
+
+  it('repairs interrupted Anthropic tool uses that are missing results', () => {
+    const payload = anthropicToKiro({
+      model: 'claude-sonnet-4.6',
+      messages: [
+        { role: 'user', content: 'ask me' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'ask_user', input: { question: 'Pick one' } }] },
+        { role: 'user', content: 'continue after failed tool submit' },
+      ],
+      tools: [{ name: 'ask_user', description: 'Ask user', input_schema: { type: 'object' } }],
+    })
+    const msg = payload.conversationState.currentMessage.userInputMessage as Record<string, unknown>
+    const ctx = msg['userInputMessageContext'] as { toolResults: { toolUseId: string; status: string; content: { text: string }[] }[] }
+    expect(ctx.toolResults).toEqual([{
+      toolUseId: 'tu_1',
+      status: 'error',
+      content: [{ text: 'Tool use was interrupted before a result was returned.' }],
+    }])
+  })
+
+  it('creates a current repair turn when Anthropic history ends with a tool use', () => {
+    const payload = anthropicToKiro({
+      model: 'claude-sonnet-4.6',
+      messages: [
+        { role: 'user', content: 'ask me' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'ask_user', input: { question: 'Pick one' } }] },
+      ],
+      tools: [{ name: 'ask_user', description: 'Ask user', input_schema: { type: 'object' } }],
+    })
+    const msg = payload.conversationState.currentMessage.userInputMessage as Record<string, unknown>
+    const ctx = msg['userInputMessageContext'] as { toolResults: { toolUseId: string; status: string }[] }
+    expect(msg['content']).toBe('Continue.')
+    expect(ctx.toolResults[0]).toMatchObject({ toolUseId: 'tu_1', status: 'error' })
   })
 
   it('rejects tool results that do not match a prior tool use', () => {
@@ -268,6 +325,20 @@ describe('openaiToKiro', () => {
       return Array.isArray(ctx?.['toolResults'])
     }) as Record<string, unknown> | undefined
     expect(toolResultTurn).toBeTruthy()
+  })
+
+  it('repairs interrupted OpenAI tool calls that are missing results', () => {
+    const payload = openaiToKiro({
+      model: 'claude-sonnet-4.6',
+      messages: [
+        { role: 'user', content: 'calc' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 'tc_1', type: 'function', function: { name: 'calc', arguments: '{"x":1}' } }] },
+        { role: 'user', content: 'continue' },
+      ],
+    })
+    const msg = payload.conversationState.currentMessage.userInputMessage as Record<string, unknown>
+    const ctx = msg['userInputMessageContext'] as { toolResults: { toolUseId: string; status: string }[] }
+    expect(ctx.toolResults[0]).toMatchObject({ toolUseId: 'tc_1', status: 'error' })
   })
 
   it('rejects OpenAI tool results and arguments that are inconsistent', () => {

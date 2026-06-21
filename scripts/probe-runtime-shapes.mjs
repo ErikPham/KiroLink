@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { execFile } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 import { request } from 'node:https'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
-const TOKEN_PATH = join(homedir(), '.aws/sso/cache/kiro-auth-token-cli.json')
+const TOKEN_CACHE_DIR = join(homedir(), '.aws/sso/cache')
+const TOKEN_FILENAMES = ['kiro-auth-token-cli.json', 'kiro-auth-token.json']
 const API_URL = 'https://runtime.us-east-1.kiro.dev/'
 const DEFAULT_MODEL = 'claude-sonnet-4.6'
 const DEFAULT_PROMPT = 'Reply with exactly: OK'
@@ -56,8 +57,8 @@ function parseArgs(argv) {
 }
 
 async function loadToken() {
-  const raw = await readFile(process.env.KIRO_PROXY_TOKEN_PATH ?? TOKEN_PATH, 'utf8')
-  const token = JSON.parse(raw)
+  const tokenPath = await resolveTokenPath()
+  const token = await readTokenFile(tokenPath)
   if (!token?.accessToken || !token?.profileArn) throw new Error('Kiro token file is missing accessToken/profileArn')
   const expiresAt = new Date(token.expiresAt).getTime()
   if (Number.isFinite(expiresAt) && Date.now() > expiresAt - 60_000) {
@@ -67,6 +68,39 @@ async function loadToken() {
     return loadToken()
   }
   return token
+}
+
+async function resolveTokenPath() {
+  if (process.env.KIRO_PROXY_TOKEN_PATH) return process.env.KIRO_PROXY_TOKEN_PATH
+
+  const candidates = TOKEN_FILENAMES.map((filename) => join(TOKEN_CACHE_DIR, filename))
+  try {
+    const entries = await readdir(TOKEN_CACHE_DIR, { withFileTypes: true })
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.endsWith('.json') && !TOKEN_FILENAMES.includes(entry.name)) {
+        candidates.push(join(TOKEN_CACHE_DIR, entry.name))
+      }
+    }
+  } catch (error) {
+    throw new Error(`Unable to read Kiro token cache directory ${TOKEN_CACHE_DIR}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  let lastError = null
+  for (const candidate of candidates) {
+    try {
+      await readTokenFile(candidate)
+      return candidate
+    } catch (error) {
+      lastError = error
+    }
+  }
+
+  throw new Error(`Could not find a valid Kiro token file in ${TOKEN_CACHE_DIR}${lastError instanceof Error ? `: ${lastError.message}` : ''}`)
+}
+
+async function readTokenFile(path) {
+  const raw = await readFile(path, 'utf8')
+  return JSON.parse(raw)
 }
 
 function buildCamelTools(count) {

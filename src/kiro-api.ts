@@ -1,4 +1,4 @@
-import { readFile, writeFile } from 'node:fs/promises'
+import { readdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { request } from 'node:https'
@@ -6,7 +6,8 @@ import { execFile } from 'node:child_process'
 import type { IncomingMessage } from 'node:http'
 import { RuntimeApiError } from './errors'
 
-const TOKEN_PATH = join(homedir(), '.aws/sso/cache/kiro-auth-token-cli.json')
+const TOKEN_CACHE_DIR = join(homedir(), '.aws/sso/cache')
+const TOKEN_FILENAMES = ['kiro-auth-token-cli.json', 'kiro-auth-token.json'] as const
 const API_URL = 'https://runtime.us-east-1.kiro.dev/'
 const ALLOWED_API_HOSTS = new Set([
   'codewhisperer.us-east-1.amazonaws.com',
@@ -19,6 +20,8 @@ const RETRY_DELAY_MS = 1000
 const MAX_RETRY_AFTER_MS = 60_000
 const REQUEST_TIMEOUT_MS = 120_000
 const MAX_ERROR_BODY_BYTES = 16 * 1024
+const MAX_CONTENT_TEXT_BYTES = 128 * 1024
+const MAX_TOOL_RESULT_TEXT_BYTES = 64 * 1024
 
 export let verbose = false
 export function setVerbose(v: boolean): void { verbose = v }
@@ -53,6 +56,13 @@ export type KiroPayload = {
   toolNameMap?: Map<string, string> | undefined
 }
 
+type TokenCandidate = {
+  path: string
+  token: KiroToken
+  mtimeMs: number
+  preferredNameRank: number
+}
+
 export async function loadToken(): Promise<KiroToken> {
   // Return cached if still valid
   if (cachedToken) {
@@ -61,22 +71,88 @@ export async function loadToken(): Promise<KiroToken> {
   }
 
   // Read from file
-  const raw = await readFile(process.env['KIRO_PROXY_TOKEN_PATH'] ?? TOKEN_PATH, 'utf8')
-  const token = JSON.parse(raw) as KiroToken
-  validateToken(token)
+  const tokenPath = await resolveTokenPath()
+  const token = await readTokenFile(tokenPath)
 
   const expiresAt = new Date(token.expiresAt).getTime()
   if (Date.now() > expiresAt - 60_000) {
     debug('[token] Expired, refreshing via kiro-cli...')
     await refreshTokenSerialized()
-    const fresh = await readFile(process.env['KIRO_PROXY_TOKEN_PATH'] ?? TOKEN_PATH, 'utf8')
-    const freshToken = JSON.parse(fresh) as KiroToken
-    validateToken(freshToken)
+    const freshPath = await resolveTokenPath()
+    const freshToken = await readTokenFile(freshPath)
     cachedToken = freshToken
     return freshToken
   }
   cachedToken = token
   return token
+}
+
+export async function resolveTokenPath(cacheDir = TOKEN_CACHE_DIR, explicitPath = process.env['KIRO_PROXY_TOKEN_PATH']): Promise<string> {
+  if (explicitPath) return explicitPath
+
+  const preferredPaths = TOKEN_FILENAMES.map((filename) => join(cacheDir, filename))
+  const candidates = [...preferredPaths]
+
+  try {
+    const entries = await readdir(cacheDir, { withFileTypes: true })
+    const discovered = entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.json') && !TOKEN_FILENAMES.includes(entry.name as typeof TOKEN_FILENAMES[number]))
+      .map((entry) => join(cacheDir, entry.name))
+    candidates.push(...discovered)
+  } catch (error) {
+    throw new Error(`Unable to read Kiro token cache directory ${cacheDir}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  const validCandidates: TokenCandidate[] = []
+  let lastError: Error | null = null
+  for (const candidate of candidates) {
+    try {
+      const [token, info] = await Promise.all([readTokenFile(candidate), stat(candidate)])
+      validCandidates.push({
+        path: candidate,
+        token,
+        mtimeMs: info.mtimeMs,
+        preferredNameRank: preferredNameScore(candidate),
+      })
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+    }
+  }
+
+  if (validCandidates.length > 0) {
+    validCandidates.sort(compareTokenCandidates)
+    return validCandidates[0]!.path
+  }
+
+  const searched = candidates.map((candidate) => `- ${candidate}`).join('\n')
+  throw new Error(`Could not find a valid Kiro token file. Searched:\n${searched}${lastError ? `\nLast error: ${lastError.message}` : ''}`)
+}
+
+async function readTokenFile(path: string): Promise<KiroToken> {
+  const raw = await readFile(path, 'utf8')
+  const token = JSON.parse(raw) as KiroToken
+  validateToken(token)
+  return token
+}
+
+function compareTokenCandidates(a: TokenCandidate, b: TokenCandidate): number {
+  const aFresh = tokenFreshnessScore(a.token)
+  const bFresh = tokenFreshnessScore(b.token)
+  if (aFresh !== bFresh) return bFresh - aFresh
+  if (a.mtimeMs !== b.mtimeMs) return b.mtimeMs - a.mtimeMs
+  if (a.preferredNameRank !== b.preferredNameRank) return a.preferredNameRank - b.preferredNameRank
+  return a.path.localeCompare(b.path)
+}
+
+function tokenFreshnessScore(token: KiroToken): number {
+  const expiresAt = new Date(token.expiresAt).getTime()
+  return Number.isFinite(expiresAt) ? expiresAt : 0
+}
+
+function preferredNameScore(path: string): number {
+  const filename = path.split('/').pop() ?? path
+  const index = TOKEN_FILENAMES.indexOf(filename as typeof TOKEN_FILENAMES[number])
+  return index === -1 ? TOKEN_FILENAMES.length : index
 }
 
 /** Ensures only one refresh runs at a time */
@@ -99,6 +175,11 @@ function refreshTokenViaCli(): Promise<void> {
 export async function callKiroApi(payload: KiroPayload, onEvent: (event: KiroStreamEvent) => void, signal?: AbortSignal): Promise<void> {
   // Truncate payload if too large
   truncatePayload(payload)
+  let pairingRepairs = repairKiroToolResultPairing(payload)
+  if (payloadSize(payload) > MAX_PAYLOAD_BYTES) {
+    truncatePayload(payload)
+    pairingRepairs = mergeToolPairingRepairStats(pairingRepairs, repairKiroToolResultPairing(payload))
+  }
   const toolNameMap = payload.toolNameMap
   delete payload.toolNameMap
 
@@ -117,6 +198,7 @@ export async function callKiroApi(payload: KiroPayload, onEvent: (event: KiroStr
     const token = await loadToken()
     payload.profileArn = token.profileArn
     const body = JSON.stringify(payload)
+    debug(`[runtime] request ${summarizeKiroPayload(payload, body, pairingRepairs)}`)
 
     if (!token.profileArn) throw new Error('Kiro token does not contain profileArn')
 
@@ -161,9 +243,7 @@ export async function callKiroApi(payload: KiroPayload, onEvent: (event: KiroStr
 
     if (resp.statusCode !== 200) {
       const errBody = await consumeText(resp, MAX_ERROR_BODY_BYTES)
-      debug(`[debug] payload keys: ${JSON.stringify(Object.keys(payload.conversationState.currentMessage))}`)
-      const msg = payload.conversationState.currentMessage.userInputMessage as Record<string, unknown>
-      debug(`[debug] modelId=${msg['modelId']} content_len=${String(msg['content']).length} history_len=${payload.conversationState.history.length}`)
+      debug(`[runtime] failed request ${summarizeKiroPayload(payload, body, pairingRepairs)}`)
       debug(`[runtime] upstream ${resp.statusCode ?? 500}: ${errBody}`)
       if (process.env['KIRO_PROXY_DUMP_FAILED_PAYLOAD'] === '1') {
         await writeFile(process.env['KIRO_PROXY_FAILED_PAYLOAD_PATH'] ?? join(tmpdir(), 'kiro-failed-payload.json'), JSON.stringify(payload, null, 2), { mode: 0o600 })
@@ -208,13 +288,179 @@ export function validateToken(token: KiroToken): void {
   if (typeof token.expiresAt !== 'string' || Number.isNaN(new Date(token.expiresAt).getTime())) throw new Error('Kiro token file is missing expiresAt')
 }
 
+type ToolPairingRepairStats = { addedMissingResults: number; removedOrphanResults: number }
+
+function mergeToolPairingRepairStats(a: ToolPairingRepairStats, b: ToolPairingRepairStats): ToolPairingRepairStats {
+  return {
+    addedMissingResults: a.addedMissingResults + b.addedMissingResults,
+    removedOrphanResults: a.removedOrphanResults + b.removedOrphanResults,
+  }
+}
+
+function payloadSize(payload: KiroPayload): number {
+  return Buffer.byteLength(JSON.stringify(payload))
+}
+
+export function repairKiroToolResultPairing(payload: KiroPayload): ToolPairingRepairStats {
+  const stats = { addedMissingResults: 0, removedOrphanResults: 0 }
+  let previousToolUseIds: string[] = []
+  const entries = [...payload.conversationState.history, payload.conversationState.currentMessage]
+
+  for (const entry of entries) {
+    if (!isRecord(entry)) continue
+    const user = entry['userInputMessage']
+    if (isRecord(user)) {
+      repairUserToolResults(user, previousToolUseIds, stats)
+      previousToolUseIds = []
+      continue
+    }
+
+    const assistant = entry['assistantResponseMessage']
+    if (!isRecord(assistant)) continue
+    previousToolUseIds = Array.isArray(assistant['toolUses'])
+      ? assistant['toolUses'].map(readToolUseId).filter((id): id is string => !!id)
+      : []
+  }
+
+  return stats
+}
+
+function repairUserToolResults(message: Record<string, unknown>, expectedToolUseIds: string[], stats: ToolPairingRepairStats): void {
+  const context = message['userInputMessageContext']
+  const expected = new Set(expectedToolUseIds)
+  const contextRecord = isRecord(context) ? context : undefined
+  const rawToolResults = contextRecord && Array.isArray(contextRecord['toolResults']) ? contextRecord['toolResults'] : []
+
+  const kept: unknown[] = []
+  for (const result of rawToolResults) {
+    const id = readToolResultId(result)
+    if (!id || !expected.has(id)) {
+      stats.removedOrphanResults++
+      continue
+    }
+    expected.delete(id)
+    kept.push(result)
+  }
+
+  for (const toolUseId of expected) {
+    kept.push(buildInterruptedRuntimeToolResult(toolUseId))
+    stats.addedMissingResults++
+  }
+
+  if (!contextRecord && !kept.length) return
+  const targetContext = contextRecord ?? ensureMessageContext(message)
+  if (kept.length) targetContext['toolResults'] = kept
+  else delete targetContext['toolResults']
+}
+
+function ensureMessageContext(message: Record<string, unknown>): Record<string, unknown> {
+  const existing = message['userInputMessageContext']
+  if (isRecord(existing)) return existing
+  const context: Record<string, unknown> = { envState: {} }
+  message['userInputMessageContext'] = context
+  return context
+}
+
+function readToolUseId(toolUse: unknown): string | undefined {
+  return isRecord(toolUse) && typeof toolUse['toolUseId'] === 'string' ? toolUse['toolUseId'] : undefined
+}
+
+function readToolResultId(result: unknown): string | undefined {
+  return isRecord(result) && typeof result['toolUseId'] === 'string' ? result['toolUseId'] : undefined
+}
+
+function buildInterruptedRuntimeToolResult(toolUseId: string): { toolUseId: string; content: { text: string }[]; status: string } {
+  return {
+    toolUseId,
+    content: [{ text: 'Tool use was interrupted before a result was returned.' }],
+    status: 'error',
+  }
+}
+
+function summarizeKiroPayload(payload: KiroPayload, body: string, repairs: ToolPairingRepairStats): string {
+  const current = payload.conversationState.currentMessage.userInputMessage
+  const currentRecord = isRecord(current) ? current : {}
+  const context = isRecord(currentRecord['userInputMessageContext']) ? currentRecord['userInputMessageContext'] : {}
+  const tools = Array.isArray(context['tools']) ? context['tools'].length : 0
+  const currentToolResults = Array.isArray(context['toolResults']) ? context['toolResults'].length : 0
+  const content = typeof currentRecord['content'] === 'string' ? currentRecord['content'] : ''
+  const fields = [
+    `body_bytes=${Buffer.byteLength(body)}`,
+    `modelId=${String(currentRecord['modelId'] ?? '')}`,
+    `history_len=${payload.conversationState.history.length}`,
+    `current_content_bytes=${Buffer.byteLength(content)}`,
+    `tools=${tools}`,
+    `current_tool_results=${currentToolResults}`,
+    `repairs=missing:${repairs.addedMissingResults},orphan:${repairs.removedOrphanResults}`,
+    `history_head=${summarizeHistoryHead(payload.conversationState.history)}`,
+    `history_tail=${summarizeHistoryTail(payload.conversationState.history)}`,
+  ]
+  return fields.join(' ')
+}
+
+function summarizeHistoryHead(history: unknown[]): string {
+  return summarizeHistorySlice(history, 0, Math.min(6, history.length))
+}
+
+function summarizeHistoryTail(history: unknown[]): string {
+  const start = Math.max(0, history.length - 8)
+  return summarizeHistorySlice(history, start, history.length)
+}
+
+function summarizeHistorySlice(history: unknown[], start: number, end: number): string {
+  const parts: string[] = []
+  for (let i = start; i < end; i++) {
+    const entry = history[i]
+    if (!isRecord(entry)) {
+      parts.push(`${i}:unknown`)
+      continue
+    }
+    const user = entry['userInputMessage']
+    if (isRecord(user)) {
+      const context = isRecord(user['userInputMessageContext']) ? user['userInputMessageContext'] : {}
+      const toolResults = Array.isArray(context['toolResults']) ? context['toolResults'].length : 0
+      const images = Array.isArray(user['images']) ? user['images'].length : 0
+      parts.push(`${i}:user(c=${stringBytes(user['content'])},tr=${toolResults},img=${images})`)
+      continue
+    }
+    const assistant = entry['assistantResponseMessage']
+    if (isRecord(assistant)) {
+      const toolUses = Array.isArray(assistant['toolUses']) ? assistant['toolUses'].length : 0
+      parts.push(`${i}:assistant(c=${stringBytes(assistant['content'])},tu=${toolUses})`)
+      continue
+    }
+    parts.push(`${i}:unknown`)
+  }
+  return parts.join(',')
+}
+
+function stringBytes(value: unknown): number {
+  return typeof value === 'string' ? Buffer.byteLength(value) : 0
+}
+
+function prefixKeepCount(history: unknown[]): number {
+  const keep = Math.min(2, history.length)
+  if (keep === 0) return 0
+
+  const lastPrefixEntry = history[keep - 1]
+  if (!isAssistantWithToolUses(lastPrefixEntry)) return keep
+
+  return Math.min(keep + 1, history.length)
+}
+
+function isAssistantWithToolUses(entry: unknown): boolean {
+  if (!isRecord(entry)) return false
+  const assistant = entry['assistantResponseMessage']
+  return isRecord(assistant) && Array.isArray(assistant['toolUses']) && assistant['toolUses'].length > 0
+}
+
 export function truncatePayload(payload: KiroPayload): void {
-  const size = () => Buffer.byteLength(JSON.stringify(payload))
+  const size = () => payloadSize(payload)
   if (size() <= MAX_PAYLOAD_BYTES) return
 
   const history = payload.conversationState.history
-  // Smart truncation: keep first 2 (system priming) + last 4 (recent context)
-  const keepStart = Math.min(2, history.length)
+  // Smart truncation: keep system priming plus any required tool result turn.
+  const keepStart = prefixKeepCount(history)
   const keepEnd = 4
   while (history.length > keepStart + keepEnd && size() > MAX_PAYLOAD_BYTES) {
     history.splice(keepStart, 1)
@@ -227,6 +473,58 @@ export function truncatePayload(payload: KiroPayload): void {
       uim['content'] = '[Earlier conversation truncated]\n' + String(uim['content'] ?? '')
     }
   }
+
+  if (size() <= MAX_PAYLOAD_BYTES) return
+  truncateMessage(payload.conversationState.currentMessage.userInputMessage)
+  for (const entry of history) truncateHistoryEntry(entry)
+
+  while (history.length > keepStart && size() > MAX_PAYLOAD_BYTES) {
+    history.splice(keepStart, 1)
+  }
+}
+
+function truncateHistoryEntry(entry: unknown): void {
+  if (!isRecord(entry)) return
+  if (isRecord(entry['userInputMessage'])) truncateMessage(entry['userInputMessage'])
+  if (isRecord(entry['assistantResponseMessage'])) {
+    const message = entry['assistantResponseMessage']
+    truncateStringField(message, 'content', MAX_CONTENT_TEXT_BYTES)
+  }
+}
+
+function truncateMessage(message: unknown): void {
+  if (!isRecord(message)) return
+  truncateStringField(message, 'content', MAX_CONTENT_TEXT_BYTES)
+  const context = message['userInputMessageContext']
+  if (isRecord(context) && Array.isArray(context['toolResults'])) {
+    for (const result of context['toolResults']) truncateToolResult(result)
+  }
+}
+
+function truncateToolResult(result: unknown): void {
+  if (!isRecord(result) || !Array.isArray(result['content'])) return
+  for (const block of result['content']) {
+    if (isRecord(block)) truncateStringField(block, 'text', MAX_TOOL_RESULT_TEXT_BYTES)
+  }
+}
+
+function truncateStringField(record: Record<string, unknown>, key: string, maxBytes: number): void {
+  const value = record[key]
+  if (typeof value !== 'string') return
+  if (Buffer.byteLength(value) <= maxBytes) return
+  record[key] = `${truncateUtf8(value, maxBytes)}\n[truncated]`
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  let bytes = 0
+  let out = ''
+  for (const char of value) {
+    const next = Buffer.byteLength(char)
+    if (bytes + next > maxBytes) break
+    bytes += next
+    out += char
+  }
+  return out
 }
 
 function kiroCliVersion(): string {
@@ -360,7 +658,87 @@ export function normalizeKiroStreamEvent(eventType: string, event: Record<string
 function finishTool(s: { toolUseId: string; name: string; inputBuf: string }, onEvent: (e: KiroStreamEvent) => void): void {
   let input: Record<string, unknown> = {}
   try { input = JSON.parse(s.inputBuf) as Record<string, unknown> } catch {}
-  onEvent({ type: 'tool_use', toolUse: { toolUseId: s.toolUseId, name: s.name, input } })
+  onEvent({ type: 'tool_use', toolUse: { toolUseId: s.toolUseId, name: s.name, input: normalizeToolInputForClient(s.name, input) } })
+}
+
+export function normalizeToolInputForClient(name: string, input: Record<string, unknown>): Record<string, unknown> {
+  if (!isAskUserQuestionTool(name)) return input
+  if (Array.isArray(input['questions'])) return normalizeAskUserQuestionInput(input)
+
+  const question = readString(input, 'question') ?? readString(input, 'prompt') ?? 'Please choose an option?'
+  const rawChoices = readArray(input, 'options') ?? readArray(input, 'choices') ?? []
+  const options = normalizeAskUserOptions(rawChoices)
+  if (options.length < 2) return input
+
+  return {
+    questions: [{
+      question: ensureQuestionMark(question),
+      header: shortHeader(readString(input, 'header') ?? question),
+      options,
+      multiSelect: input['multiSelect'] === true || input['multi_select'] === true,
+    }],
+  }
+}
+
+function isAskUserQuestionTool(name: string): boolean {
+  return name === 'AskUserQuestion' || name === 'askUserQuestion' || name === 'ask_user_question' || name === 'ask_user'
+}
+
+function normalizeAskUserQuestionInput(input: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...input,
+    questions: (input['questions'] as unknown[]).map((question) => {
+      if (!isRecord(question)) return question
+      const rawOptions = Array.isArray(question['options'])
+        ? question['options']
+        : Array.isArray(question['choices'])
+          ? question['choices']
+          : []
+      return {
+        ...question,
+        question: ensureQuestionMark(readString(question, 'question') ?? 'Please choose an option?'),
+        header: shortHeader(readString(question, 'header') ?? readString(question, 'question') ?? 'Question'),
+        options: normalizeAskUserOptions(rawOptions),
+        multiSelect: question['multiSelect'] === true || question['multi_select'] === true,
+      }
+    }),
+  }
+}
+
+function normalizeAskUserOptions(rawOptions: unknown[]): { label: string; description: string; preview?: string }[] {
+  return rawOptions.slice(0, 4).map((option, index) => {
+    if (typeof option === 'string') return { label: shortLabel(option, index), description: option }
+    if (isRecord(option)) {
+      const label = shortLabel(readString(option, 'label') ?? readString(option, 'title') ?? readString(option, 'value') ?? `Option ${index + 1}`, index)
+      const description = readString(option, 'description') ?? readString(option, 'detail') ?? label
+      const preview = readString(option, 'preview')
+      return preview ? { label, description, preview } : { label, description }
+    }
+    return { label: `Option ${index + 1}`, description: String(option) }
+  })
+}
+
+function readString(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key]
+  return typeof value === 'string' && value.trim() ? value : undefined
+}
+
+function readArray(record: Record<string, unknown>, key: string): unknown[] | undefined {
+  const value = record[key]
+  return Array.isArray(value) ? value : undefined
+}
+
+function shortHeader(value: string): string {
+  return value.replace(/\s+/gu, ' ').trim().slice(0, 12) || 'Question'
+}
+
+function shortLabel(value: string, index: number): string {
+  return value.replace(/\s+/gu, ' ').trim().slice(0, 40) || `Option ${index + 1}`
+}
+
+function ensureQuestionMark(value: string): string {
+  const trimmed = value.trim()
+  return /[?？]$/u.test(trimmed) ? trimmed : `${trimmed}?`
 }
 
 function norm(chunk: string, prev: string): string {

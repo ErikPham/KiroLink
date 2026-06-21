@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { normalizeKiroStreamEvent, resolveKiroApiUrl, truncatePayload, validateToken } from '../src/kiro-api'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { normalizeKiroStreamEvent, normalizeToolInputForClient, repairKiroToolResultPairing, resolveKiroApiUrl, resolveTokenPath, truncatePayload, validateToken } from '../src/kiro-api'
 import { RuntimeApiError } from '../src/errors'
 
 const MAX_PAYLOAD_BYTES = 900 * 1024
@@ -61,6 +64,175 @@ describe('payload truncation', () => {
       expect(size).toBeLessThanOrEqual(MAX_PAYLOAD_BYTES)
     }
   })
+
+  it('truncates oversized current tool results after history pruning', () => {
+    const payload = {
+      conversationState: {
+        chatTriggerType: 'MANUAL',
+        conversationId: 'test',
+        currentMessage: {
+          userInputMessage: {
+            content: 'continue',
+            modelId: 'claude-sonnet-4.6',
+            origin: 'AI_EDITOR',
+            userInputMessageContext: {
+              toolResults: [{
+                toolUseId: 'tooluse_big',
+                content: [{ text: 'x'.repeat(1_000_000) }],
+                status: 'success',
+              }],
+            },
+          },
+        },
+        history: [],
+      },
+      profileArn: 'arn:test',
+    }
+
+    truncatePayload(payload)
+
+    expect(Buffer.byteLength(JSON.stringify(payload))).toBeLessThanOrEqual(MAX_PAYLOAD_BYTES)
+    const text = payload.conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults[0]!.content[0]!.text
+    expect(text).toContain('[truncated]')
+  })
+
+  it('keeps the required first tool result when truncating history', () => {
+    const bigContent = 'x'.repeat(100_000)
+    const payload = {
+      conversationState: {
+        chatTriggerType: 'MANUAL',
+        conversationId: 'test',
+        currentMessage: { userInputMessage: { content: 'continue', modelId: 'claude-sonnet-4.6', origin: 'AI_EDITOR', userInputMessageContext: {} } },
+        history: [
+          { userInputMessage: { content: 'start', origin: 'AI_EDITOR', userInputMessageContext: {} } },
+          { assistantResponseMessage: { content: '', toolUses: [{ toolUseId: 'first_tool', name: 'ask_user', input: {} }] } },
+          { userInputMessage: { content: 'done', origin: 'AI_EDITOR', userInputMessageContext: { toolResults: [{ toolUseId: 'first_tool', content: [{ text: 'ok' }], status: 'success' }] } } },
+          ...Array.from({ length: 30 }, (_, i) => ({
+            [i % 2 === 0 ? 'assistantResponseMessage' : 'userInputMessage']: i % 2 === 0
+              ? { content: bigContent, toolUses: [] }
+              : { content: bigContent, origin: 'AI_EDITOR', userInputMessageContext: {} },
+          })),
+        ],
+      },
+      profileArn: 'arn:test',
+    }
+
+    truncatePayload(payload)
+    const repairs = repairKiroToolResultPairing(payload)
+
+    expect(repairs).toEqual({ addedMissingResults: 0, removedOrphanResults: 0 })
+    expect(payload.conversationState.history[2]!.userInputMessage.userInputMessageContext.toolResults).toEqual([
+      { toolUseId: 'first_tool', content: [{ text: 'ok' }], status: 'success' },
+    ])
+  })
+})
+
+describe('client tool input compatibility', () => {
+  it('normalizes Kiro-style question choices into Claude Code AskUserQuestion input', () => {
+    const input = normalizeToolInputForClient('AskUserQuestion', {
+      question: 'Pick an approach',
+      choices: ['Fast path', { label: 'Safe path', description: 'More validation' }],
+    })
+
+    expect(input).toEqual({
+      questions: [{
+        question: 'Pick an approach?',
+        header: 'Pick an appr',
+        options: [
+          { label: 'Fast path', description: 'Fast path' },
+          { label: 'Safe path', description: 'More validation' },
+        ],
+        multiSelect: false,
+      }],
+    })
+  })
+
+  it('normalizes questions arrays that use choices instead of options', () => {
+    const input = normalizeToolInputForClient('ask_user_question', {
+      questions: [{
+        question: 'Which one?',
+        header: 'Choice',
+        choices: [{ label: 'A', description: 'First' }, { label: 'B', description: 'Second' }],
+      }],
+    })
+
+    expect(input).toMatchObject({
+      questions: [{
+        question: 'Which one?',
+        header: 'Choice',
+        options: [{ label: 'A', description: 'First' }, { label: 'B', description: 'Second' }],
+        multiSelect: false,
+      }],
+    })
+  })
+})
+
+describe('runtime tool result pairing repair', () => {
+  it('adds missing results to the immediate following user turn', () => {
+    const payload = {
+      conversationState: {
+        chatTriggerType: 'MANUAL',
+        conversationId: 'test',
+        history: [
+          { assistantResponseMessage: { content: '', toolUses: [{ toolUseId: 'old_tool', name: 'ask_user', input: {} }] } },
+          { userInputMessage: { content: 'continue', userInputMessageContext: {}, origin: 'AI_EDITOR', modelId: 'claude-sonnet-4.6' } },
+          { assistantResponseMessage: { content: '', toolUses: [{ toolUseId: 'current_tool', name: 'ask_user', input: {} }] } },
+        ],
+        currentMessage: {
+          userInputMessage: {
+            content: 'done',
+            origin: 'AI_EDITOR',
+            modelId: 'claude-sonnet-4.6',
+            userInputMessageContext: {
+              toolResults: [{ toolUseId: 'current_tool', content: [{ text: 'ok' }], status: 'success' }],
+            },
+          },
+        },
+      },
+      profileArn: 'arn:test',
+    }
+
+    const repairs = repairKiroToolResultPairing(payload)
+
+    expect(repairs).toEqual({ addedMissingResults: 1, removedOrphanResults: 0 })
+    const repairedUser = payload.conversationState.history[1]!.userInputMessage.userInputMessageContext.toolResults
+    expect(repairedUser).toEqual([{ toolUseId: 'old_tool', content: [{ text: 'Tool use was interrupted before a result was returned.' }], status: 'error' }])
+    const currentResults = payload.conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults
+    expect(currentResults).toEqual([{ toolUseId: 'current_tool', content: [{ text: 'ok' }], status: 'success' }])
+  })
+
+  it('removes current tool results that do not belong to the previous assistant turn', () => {
+    const payload = {
+      conversationState: {
+        chatTriggerType: 'MANUAL',
+        conversationId: 'test',
+        history: [
+          { assistantResponseMessage: { content: '', toolUses: [{ toolUseId: 'expected_tool', name: 'ask_user', input: {} }] } },
+        ],
+        currentMessage: {
+          userInputMessage: {
+            content: 'done',
+            origin: 'AI_EDITOR',
+            modelId: 'claude-sonnet-4.6',
+            userInputMessageContext: {
+              toolResults: [
+                { toolUseId: 'stale_tool', content: [{ text: 'stale' }], status: 'success' },
+                { toolUseId: 'expected_tool', content: [{ text: 'ok' }], status: 'success' },
+              ],
+            },
+          },
+        },
+      },
+      profileArn: 'arn:test',
+    }
+
+    const repairs = repairKiroToolResultPairing(payload)
+
+    expect(repairs).toEqual({ addedMissingResults: 0, removedOrphanResults: 1 })
+    expect(payload.conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults).toEqual([
+      { toolUseId: 'expected_tool', content: [{ text: 'ok' }], status: 'success' },
+    ])
+  })
 })
 
 describe('runtime API URL safety', () => {
@@ -113,6 +285,58 @@ describe('token validation', () => {
     expect(() => validateToken({ accessToken: 'x'.repeat(32), refreshToken: '', expiresAt: 'bad', profileArn: 'arn:x' })).toThrow('expiresAt')
     expect(() => validateToken({ accessToken: 'x'.repeat(32), refreshToken: '', expiresAt: new Date().toISOString(), profileArn: 'not-an-arn' })).toThrow('profileArn')
   })
+
+  it('falls back to kiro-auth-token.json when the legacy cli filename is missing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kirolink-token-'))
+    try {
+      writeFileSync(join(dir, 'kiro-auth-token.json'), JSON.stringify({
+        accessToken: 'x'.repeat(32),
+        refreshToken: 'refresh',
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        profileArn: 'arn:aws:codewhisperer:us-east-1:123:profile/example',
+      }))
+      await expect(resolveTokenPath(dir, undefined)).resolves.toBe(join(dir, 'kiro-auth-token.json'))
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('discovers a valid token file by schema when filenames drift again', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kirolink-token-'))
+    try {
+      writeFileSync(join(dir, 'random-sso-cache.json'), JSON.stringify({ startUrl: 'https://example.com/start' }))
+      writeFileSync(join(dir, 'future-kiro-token.json'), JSON.stringify({
+        accessToken: 'y'.repeat(32),
+        refreshToken: 'refresh',
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        profileArn: 'arn:aws:codewhisperer:us-east-1:123:profile/example',
+      }))
+      await expect(resolveTokenPath(dir, undefined)).resolves.toBe(join(dir, 'future-kiro-token.json'))
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('prefers the freshest valid token file over legacy filenames', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kirolink-token-'))
+    try {
+      writeFileSync(join(dir, 'kiro-auth-token-cli.json'), JSON.stringify({
+        accessToken: 'x'.repeat(32),
+        refreshToken: 'refresh',
+        expiresAt: '2026-01-01T00:00:00.000Z',
+        profileArn: 'arn:aws:codewhisperer:us-east-1:123:profile/example',
+      }))
+      writeFileSync(join(dir, 'kiro-auth-token.json'), JSON.stringify({
+        accessToken: 'y'.repeat(32),
+        refreshToken: 'refresh',
+        expiresAt: '2026-06-01T00:00:00.000Z',
+        profileArn: 'arn:aws:codewhisperer:us-east-1:123:profile/example',
+      }))
+      await expect(resolveTokenPath(dir, undefined)).resolves.toBe(join(dir, 'kiro-auth-token.json'))
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('runtime API errors', () => {
@@ -120,6 +344,18 @@ describe('runtime API errors', () => {
     const error = new RuntimeApiError(403, '{"message":"secret upstream detail"}')
     expect(error.message).toBe('Kiro runtime request failed with status 403')
     expect(error.upstreamBody).toContain('secret upstream detail')
+  })
+
+  it('can expose summarized upstream errors for local debugging', () => {
+    const prev = process.env['KIRO_PROXY_EXPOSE_UPSTREAM_ERRORS']
+    try {
+      process.env['KIRO_PROXY_EXPOSE_UPSTREAM_ERRORS'] = '1'
+      const error = new RuntimeApiError(400, '{"__type":"ValidationException","message":"invalid tool schema"}')
+      expect(error.message).toBe('Kiro runtime request failed with status 400: ValidationException invalid tool schema')
+    } finally {
+      if (prev === undefined) delete process.env['KIRO_PROXY_EXPOSE_UPSTREAM_ERRORS']
+      else process.env['KIRO_PROXY_EXPOSE_UPSTREAM_ERRORS'] = prev
+    }
   })
 })
 

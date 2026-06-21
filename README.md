@@ -83,8 +83,8 @@ KIRO_PROXY_HOST=127.0.0.1
 KIRO_PROXY_API_KEY=your-key
 KIRO_PROXY_MAX_CONCURRENT=2
 KIRO_PROXY_DELAY_MS=200
-KIRO_PROXY_MAX_BODY_BYTES=1048576
-KIRO_PROXY_TOKEN_PATH=~/.aws/sso/cache/kiro-auth-token-cli.json
+KIRO_PROXY_MAX_BODY_BYTES=16777216
+KIRO_PROXY_TOKEN_PATH=~/.aws/sso/cache/kiro-auth-token.json
 KIRO_PROXY_API_URL=https://runtime.us-east-1.kiro.dev/
 KIRO_PROXY_ALLOW_UNTRUSTED_API_URL=0
 KIRO_PROXY_CODEWHISPERER_OPTOUT=true
@@ -97,6 +97,7 @@ KIRO_PROXY_MAX_TOOL_SCHEMA_BYTES=131072
 KIRO_PROXY_MAX_TOTAL_TOOL_SCHEMA_BYTES=786432
 KIRO_PROXY_DUMP_FAILED_PAYLOAD=0
 KIRO_PROXY_FAILED_PAYLOAD_PATH=/tmp/kiro-failed-payload.json
+KIRO_PROXY_EXPOSE_UPSTREAM_ERRORS=0
 ```
 
 ## How it works
@@ -105,11 +106,11 @@ KIRO_PROXY_FAILED_PAYLOAD_PATH=/tmp/kiro-failed-payload.json
 Claude Code ──→ /v1/messages ──→ KiroLink ──→ Kiro API
 Codex ─────→ /v1/chat/completions ─┘              │
                                          ↕
-                          ~/.aws/sso/cache/kiro-auth-token-cli.json
-                                (managed by kiro-cli)
+                          ~/.aws/sso/cache/kiro-auth-token*.json
+                           (auto-detected from Kiro auth cache)
 ```
 
-1. Reads token from `kiro-cli`'s auth cache (auto-refreshed via `kiro-cli` when expired)
+1. Reads token from Kiro's auth cache (prefers `KIRO_PROXY_TOKEN_PATH`, otherwise auto-detects compatible token files in `~/.aws/sso/cache/` and refreshes via `kiro-cli` when expired)
 2. Translates API requests → Kiro `generateAssistantResponse`
 3. Parses AWS Event Stream binary response
 4. Translates back to Anthropic/OpenAI format
@@ -125,6 +126,7 @@ Runtime safety notes:
 - Claude/Codex system prompts are preserved by default. `KIRO_PROXY_FILTER_SYSTEM_PROMPT=1` and `KIRO_PROXY_INJECT_THINKING_PROMPT=1` are experimental opt-ins.
 - Tool names, tool IDs, tool-result links, model IDs, image media types, output token limits, and schema sizes are validated before a request is sent to Kiro.
 - Failed payload dumps are disabled by default because they may contain prompt or tool output data. Enable `KIRO_PROXY_DUMP_FAILED_PAYLOAD=1` only for local debugging.
+- Upstream Kiro error bodies are hidden from client-facing messages by default. Set `KIRO_PROXY_EXPOSE_UPSTREAM_ERRORS=1` only for local debugging when a `400` needs its runtime validation detail.
 
 ### Runtime verification against Kiro CLI
 

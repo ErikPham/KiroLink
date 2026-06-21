@@ -6,7 +6,7 @@ export type AnthropicContentBlock =
   | { type: 'text'; text: string }
   | { type: 'image'; source: { type: string; media_type: string; data: string } }
   | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
-  | { type: 'tool_result'; tool_use_id: string; content: unknown }
+  | { type: 'tool_result'; tool_use_id: string; content: unknown; is_error?: boolean }
   | { type: 'thinking'; thinking: string }
   | { type: string; [key: string]: unknown }
 
@@ -39,6 +39,11 @@ const THINKING_PROMPT = 'enabled 200000'
 
 // kiro-cli sends origin "KIRO_CLI" (not "AI_EDITOR" which is the IDE)
 const KIRO_ORIGIN = 'KIRO_CLI'
+const SYNTHETIC_IMAGE_TOOL_NAME = 'fs_read'
+const SYNTHETIC_IMAGE_TOOL_RESULT_TEXT = 'See images data supplied'
+const SYNTHETIC_IMAGE_PLACEHOLDER_PREFIX = '/tmp/kirolink-image'
+
+type KiroImage = { format: string; source: { bytes: string } }
 
 function buildEnvState(): Record<string, string> {
   const os = process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux'
@@ -53,13 +58,16 @@ export function anthropicToKiro(req: AnthropicRequest): KiroPayload {
   const thinking = req.thinking?.type === 'enabled' || req.thinking?.type === 'adaptive'
   const filtered = filterSystemPrompt(systemText)
   const effectiveSystem = thinking && shouldInjectThinkingPrompt() ? `${THINKING_PROMPT}\n\n${filtered}` : filtered
-  const { specs: tools, responseNameMap: toolNameMap, requestNameMap } = buildToolSpecs(req.tools ?? [], 'Anthropic')
+  const requestedTools = hasAnthropicImageInput(messages)
+    ? [syntheticImageToolDefinition(), ...(req.tools ?? [])]
+    : (req.tools ?? [])
+  const { specs: tools, responseNameMap: toolNameMap, requestNameMap } = buildToolSpecs(requestedTools, 'Anthropic')
   const seenToolUseIds = new Set<string>()
 
   // Flatten messages into alternating user/assistant for Kiro history
   // Claude Code sends: user, assistant(tool_use), user(tool_result), assistant, ...
   // Kiro expects: strict alternating userInputMessage / assistantResponseMessage
-  const flat: { role: 'user' | 'assistant'; text: string; images: unknown[]; toolUses: KiroToolUse[]; toolResults: unknown[] }[] = []
+  const flat: { role: 'user' | 'assistant'; text: string; images: KiroImage[]; toolUses: KiroToolUse[]; toolResults: unknown[] }[] = []
 
   for (const msg of messages) {
     const text = extractText(msg.content)
@@ -78,15 +86,22 @@ export function anthropicToKiro(req: AnthropicRequest): KiroPayload {
       flat.push({ role: msg.role, text, images, toolUses, toolResults })
     }
   }
+  repairMissingToolResults(flat, (toolResults) => ({ role: 'user', text: 'Continue.', images: [], toolUses: [], toolResults }))
 
   // Build history from all except last entry
   const history: unknown[] = []
   for (let i = 0; i < flat.length - 1; i++) {
     const entry = flat[i]!
     if (entry.role === 'user') {
+      const imageToolUse = entry.images.length ? buildSyntheticImageToolUse(entry.images) : undefined
+      if (imageToolUse) {
+        history.push({ userInputMessage: { content: syntheticImagePlaceholderContent(entry.images), userInputMessageContext: { envState: buildEnvState() }, origin: KIRO_ORIGIN, modelId } })
+        history.push({ assistantResponseMessage: { content: '', toolUses: [imageToolUse] } })
+      }
       const content = i === 0 && effectiveSystem ? `${effectiveSystem}\n\n${entry.text}` : entry.text
       const ctx: Record<string, unknown> = { envState: buildEnvState() }
-      if (entry.toolResults.length) ctx['toolResults'] = entry.toolResults
+      const toolResults = imageToolUse ? [buildSyntheticImageToolResult(imageToolUse.toolUseId), ...entry.toolResults] : entry.toolResults
+      if (toolResults.length) ctx['toolResults'] = toolResults
       const uim: Record<string, unknown> = { content: content || 'Continue.', userInputMessageContext: ctx, origin: KIRO_ORIGIN, modelId }
       if (entry.images.length) uim['images'] = entry.images
       history.push({ userInputMessage: uim })
@@ -100,13 +115,19 @@ export function anthropicToKiro(req: AnthropicRequest): KiroPayload {
   const userContent = last?.role === 'user' ? last.text : ''
   const currentImages = last?.role === 'user' ? last.images : []
   const lastToolResults = last?.role === 'user' ? last.toolResults : []
+  const currentImageToolUse = last?.role === 'user' && currentImages.length ? buildSyntheticImageToolUse(currentImages) : undefined
+  if (currentImageToolUse) {
+    history.push({ userInputMessage: { content: syntheticImagePlaceholderContent(currentImages), userInputMessageContext: { envState: buildEnvState() }, origin: KIRO_ORIGIN, modelId } })
+    history.push({ assistantResponseMessage: { content: '', toolUses: [currentImageToolUse] } })
+  }
   const fullContent = (flat.length === 1 || flat[0]?.role !== 'user') && effectiveSystem
     ? `${effectiveSystem}\n\n${userContent}`
     : userContent || 'Continue.'
 
   const userMsgCtx: Record<string, unknown> = { envState: buildEnvState() }
   if (tools.length) userMsgCtx['tools'] = tools
-  if (lastToolResults.length) userMsgCtx['toolResults'] = lastToolResults
+  const currentToolResults = currentImageToolUse ? [buildSyntheticImageToolResult(currentImageToolUse.toolUseId), ...lastToolResults] : lastToolResults
+  if (currentToolResults.length) userMsgCtx['toolResults'] = currentToolResults
 
   const currentUim: Record<string, unknown> = { content: fullContent, userInputMessageContext: userMsgCtx, origin: KIRO_ORIGIN, modelId }
   if (currentImages.length) currentUim['images'] = currentImages
@@ -132,6 +153,7 @@ function mapModelId(model: string): string {
   if (typeof model !== 'string' || !model) throw new InvalidRequestError('model is required')
   let id = model.replace(/\[1m\]$/u, '').replace(/-\d{8}$/u, '')
   id = id.replace(/^(claude-(?:opus|sonnet|haiku)-\d+)-(\d+)$/u, '$1.$2')
+  id = id.replace(/^(claude-(?:opus|sonnet|haiku)-\d+)-(\d+)-\d{8}$/u, '$1.$2')
   if (!MODEL_ID_PATTERN.test(id)) throw new InvalidRequestError(`Unsupported model id: ${model}`)
   return id
 }
@@ -170,7 +192,7 @@ function extractText(content: string | AnthropicContentBlock[]): string {
   return content.filter((b): b is { type: 'text'; text: string } => b.type === 'text').map((b) => b.text).join('\n')
 }
 
-function extractImages(content: string | AnthropicContentBlock[]): unknown[] {
+function extractImages(content: string | AnthropicContentBlock[]): KiroImage[] {
   if (typeof content === 'string') return []
   const imageBlocks = content.filter((b) => b.type === 'image' && 'source' in b)
   if (imageBlocks.length > MAX_IMAGES) throw new InvalidRequestError(`image count exceeds ${MAX_IMAGES}`)
@@ -183,6 +205,59 @@ function extractImages(content: string | AnthropicContentBlock[]): unknown[] {
     const format = src.media_type === 'image/jpeg' ? 'jpeg' : src.media_type.split('/')[1] || 'png'
     return { format, source: { bytes: src.data } }
   })
+}
+
+function hasAnthropicImageInput(messages: AnthropicMessage[]): boolean {
+  return messages.some((msg) => typeof msg.content !== 'string' && msg.content.some((block) => block.type === 'image'))
+}
+
+function syntheticImageToolDefinition(): { name: string; description: string; input_schema: unknown } {
+  return {
+    name: SYNTHETIC_IMAGE_TOOL_NAME,
+    description: 'Read image attachments prepared by the client before model analysis.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        operations: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              mode: { type: 'string', enum: ['Image'] },
+              image_paths: { type: 'array', items: { type: 'string' } },
+            },
+            required: ['mode', 'image_paths'],
+          },
+        },
+      },
+      required: ['operations'],
+    },
+  }
+}
+
+function buildSyntheticImageToolUse(images: KiroImage[]): KiroToolUse {
+  return {
+    toolUseId: `tooluse_${randomUUID().replace(/-/gu, '')}`,
+    name: SYNTHETIC_IMAGE_TOOL_NAME,
+    input: {
+      operations: [{
+        mode: 'Image',
+        image_paths: images.map((image, index) => `${SYNTHETIC_IMAGE_PLACEHOLDER_PREFIX}-${index + 1}.${image.format}`),
+      }],
+    },
+  }
+}
+
+function buildSyntheticImageToolResult(toolUseId: string): { toolUseId: string; content: { text: string }[]; status: string } {
+  return {
+    toolUseId,
+    content: [{ text: SYNTHETIC_IMAGE_TOOL_RESULT_TEXT }],
+    status: 'success',
+  }
+}
+
+function syntheticImagePlaceholderContent(images: KiroImage[]): string {
+  return images.map((image, index) => `${SYNTHETIC_IMAGE_PLACEHOLDER_PREFIX}-${index + 1}.${image.format}`).join('\n')
 }
 
 function extractToolUses(content: string | AnthropicContentBlock[], seenToolUseIds: Set<string>, requestNameMap: Map<string, string>): KiroToolUse[] {
@@ -201,10 +276,71 @@ function extractToolUses(content: string | AnthropicContentBlock[], seenToolUseI
 function extractToolResults(content: string | AnthropicContentBlock[] | undefined, seenToolUseIds: Set<string>, source: string): unknown[] {
   if (!content || typeof content === 'string') return []
   return content.filter((b) => b.type === 'tool_result').map((b) => {
-    const tr = b as { tool_use_id: string; content: unknown }
+    const tr = b as { tool_use_id: string; content: unknown; is_error?: boolean }
     validateKnownToolResultId(tr.tool_use_id, seenToolUseIds, source)
-    return { toolUseId: tr.tool_use_id, content: [{ text: stringifyToolResultContent(tr.content, source) }], status: 'success' }
+    return { toolUseId: tr.tool_use_id, content: [{ text: stringifyToolResultContent(tr.content, source) }], status: tr.is_error ? 'error' : 'success' }
   })
+}
+
+function repairMissingToolResults<T extends { role: 'user' | 'assistant'; text: string; toolUses: KiroToolUse[]; toolResults: unknown[] }>(
+  flat: T[],
+  makeUserEntry: (toolResults: unknown[]) => T,
+): void {
+  const resolvedToolUseIds = collectToolResultIds(flat)
+  let appendedUserEntry: T | undefined
+
+  for (let i = 0; i < flat.length; i++) {
+    const entry = flat[i]!
+    if (entry.role !== 'assistant') continue
+
+    for (const toolUse of entry.toolUses) {
+      if (resolvedToolUseIds.has(toolUse.toolUseId)) continue
+      const repair = buildInterruptedToolResult(toolUse.toolUseId)
+      const nextUser = findNextUserEntry(flat, i + 1)
+      if (nextUser) {
+        nextUser.toolResults.unshift(repair)
+      } else {
+        if (!appendedUserEntry) {
+          appendedUserEntry = makeUserEntry([])
+          flat.push(appendedUserEntry)
+        }
+        appendedUserEntry.toolResults.push(repair)
+      }
+      resolvedToolUseIds.add(toolUse.toolUseId)
+    }
+  }
+}
+
+function collectToolResultIds(entries: { role: 'user' | 'assistant'; toolResults: unknown[] }[]): Set<string> {
+  const ids = new Set<string>()
+  for (const entry of entries) {
+    if (entry.role !== 'user') continue
+    for (const result of entry.toolResults) {
+      const id = readToolResultId(result)
+      if (id) ids.add(id)
+    }
+  }
+  return ids
+}
+
+function findNextUserEntry<T extends { role: 'user' | 'assistant' }>(entries: T[], start: number): T | undefined {
+  for (let i = start; i < entries.length; i++) {
+    const entry = entries[i]!
+    if (entry.role === 'user') return entry
+  }
+  return undefined
+}
+
+function readToolResultId(result: unknown): string | undefined {
+  return isRecord(result) && typeof result['toolUseId'] === 'string' ? result['toolUseId'] : undefined
+}
+
+function buildInterruptedToolResult(toolUseId: string): { toolUseId: string; content: { text: string }[]; status: string } {
+  return {
+    toolUseId,
+    content: [{ text: 'Tool use was interrupted before a result was returned.' }],
+    status: 'error',
+  }
 }
 
 export function buildAnthropicResponse(model: string, contentBlocks: AnthropicContentBlock[], inputTokens: number, outputTokens: number): unknown {
@@ -270,6 +406,7 @@ export function openaiToKiro(req: OpenAIRequest): KiroPayload {
       flat.push(entry)
     }
   }
+  repairMissingToolResults(flat, (toolResults) => ({ role: 'user', text: 'Continue.', toolUses: [], toolResults }))
 
   // Build history (all except the current turn)
   for (let i = 0; i < flat.length - 1; i++) {
