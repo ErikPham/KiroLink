@@ -12,10 +12,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/) and
 
 ### Fixed
 
+## [1.0.5] - 2026-07-15
+
+First npm-publishable release after prior versions were unpublished
+(`1.0.0`–`1.0.4`, `1.1.0`, `2.0.0` are reserved by the registry and cannot
+be reused). Same product content as the `1.0.0` GitHub tag, plus CI fixes
+so Publish can install pnpm from `packageManager`.
+
+### Fixed
+- CI/Publish: resolve pnpm solely from `package.json` `packageManager`
+- Flaky Node 18 body-size server test timeout
+
 ## [1.0.0] - 2026-07-15
 
-First public release of KiroLink — an Anthropic- and OpenAI-compatible proxy
-backed by the Kiro runtime.
+First public GitHub release of KiroLink — an Anthropic- and OpenAI-compatible
+proxy backed by the Kiro runtime. (npm cannot reuse this version number after
+the earlier unpublish.)
 
 ### Features
 - Anthropic-compatible `POST /v1/messages` (streaming + non-stream)
