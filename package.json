@@ -1,6 +1,6 @@
 {
   "name": "kirolink",
-  "version": "1.0.5",
+  "version": "1.0.0",
   "description": "Anthropic & OpenAI compatible proxy backed by Kiro. Works with Claude Code and Codex.",
   "type": "module",
   "packageManager": "pnpm@10.12.1",
