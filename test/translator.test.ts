@@ -14,11 +14,71 @@ describe('anthropicToKiro', () => {
     expect(msg['modelId']).toBe('claude-opus-4.8')
   })
 
-  it('uses a fresh conversation id for independent requests', () => {
-    const a = anthropicToKiro({ model: 'claude-sonnet-4.6', messages: [{ role: 'user', content: 'a' }] })
-    const b = anthropicToKiro({ model: 'claude-sonnet-4.6', messages: [{ role: 'user', content: 'b' }] })
+  it('reuses a stable conversation id across turns of the same conversation', () => {
+    const longPrompt = 'Please refactor the authentication module and add unit tests'
+    const first = anthropicToKiro({ model: 'claude-sonnet-4.6', system: 'You are helpful.', messages: [{ role: 'user', content: longPrompt }] })
+    const second = anthropicToKiro({ model: 'claude-sonnet-4.6', system: 'You are helpful.', messages: [
+      { role: 'user', content: longPrompt },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'next step' },
+    ] })
+    expect(second.conversationState.conversationId).toBe(first.conversationState.conversationId)
+    expect(first.conversationState.agentContinuationId).toBeUndefined()
+  })
+
+  it('derives different conversation ids for different first messages', () => {
+    const a = anthropicToKiro({ model: 'claude-sonnet-4.6', messages: [{ role: 'user', content: 'Refactor the auth module and add coverage' }] })
+    const b = anthropicToKiro({ model: 'claude-sonnet-4.6', messages: [{ role: 'user', content: 'Investigate the flaky CI pipeline failures' }] })
     expect(a.conversationState.conversationId).not.toBe(b.conversationState.conversationId)
-    expect(a.conversationState.agentContinuationId).toBeUndefined()
+  })
+
+  it('uses a random id for empty/short/synthetic first messages (collision guard)', () => {
+    // Image-only / empty first turn: extractText -> '' -> must be random, not a
+    // shared deterministic id across independent conversations.
+    const a = anthropicToKiro({ model: 'claude-sonnet-4.6', system: 'sys', messages: [{ role: 'user', content: 'hi' }] })
+    const b = anthropicToKiro({ model: 'claude-sonnet-4.6', system: 'sys', messages: [{ role: 'user', content: 'hi' }] })
+    expect(a.conversationState.conversationId).not.toBe(b.conversationState.conversationId)
+  })
+
+  it('omits envState from history user turns but keeps it on the current message', () => {
+    const payload = anthropicToKiro({ model: 'claude-sonnet-4.6', messages: [
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: 'reply' },
+      { role: 'user', content: 'second' },
+    ] })
+    const hist0 = payload.conversationState.history[0] as { userInputMessage: Record<string, unknown> }
+    expect(hist0.userInputMessage['userInputMessageContext']).toBeUndefined()
+    const cur = payload.conversationState.currentMessage.userInputMessage as Record<string, unknown>
+    expect((cur['userInputMessageContext'] as Record<string, unknown>)['envState']).toBeDefined()
+  })
+
+  it('forces a random conversation id when KIRO_PROXY_RANDOM_CONVERSATION_ID=1', () => {
+    const savedRandomConversationId = process.env['KIRO_PROXY_RANDOM_CONVERSATION_ID']
+    process.env['KIRO_PROXY_RANDOM_CONVERSATION_ID'] = '1'
+    try {
+      const longPrompt = 'Please refactor the authentication module and add unit tests'
+      const a = anthropicToKiro({ model: 'claude-sonnet-4.6', system: 'sys', messages: [{ role: 'user', content: longPrompt }] })
+      const b = anthropicToKiro({ model: 'claude-sonnet-4.6', system: 'sys', messages: [{ role: 'user', content: longPrompt }] })
+      expect(a.conversationState.conversationId).not.toBe(b.conversationState.conversationId)
+    } finally {
+      if (savedRandomConversationId === undefined) delete process.env['KIRO_PROXY_RANDOM_CONVERSATION_ID']
+      else process.env['KIRO_PROXY_RANDOM_CONVERSATION_ID'] = savedRandomConversationId
+    }
+  })
+
+  it('rejects when combined top-level and tool_result images exceed the limit', () => {
+    const img = { type: 'image' as const, source: { type: 'base64' as const, media_type: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' } }
+    const topLevel = Array.from({ length: 20 }, () => img)
+    expect(() => anthropicToKiro({
+      model: 'claude-sonnet-4.6',
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'tu1', name: 'fetch', input: {} }] },
+        { role: 'user', content: [
+          ...topLevel,
+          { type: 'tool_result', tool_use_id: 'tu1', content: [img] },
+        ] },
+      ],
+    })).toThrow(/image count exceeds/)
   })
 
   it('maps model IDs correctly', () => {
@@ -199,6 +259,77 @@ describe('anthropicToKiro', () => {
     const msg = payload.conversationState.currentMessage.userInputMessage as Record<string, unknown>
     const ctx = msg['userInputMessageContext'] as Record<string, unknown>
     expect(ctx['toolResults']).toHaveLength(1)
+  })
+
+  it('truncates oversized Anthropic tool results instead of rejecting the request', () => {
+    const payload = anthropicToKiro({
+      model: 'claude-sonnet-4.6',
+      messages: [
+        { role: 'user', content: 'read references' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_big', name: 'read_file', input: { path: 'screenshot.txt' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_big', content: 'x'.repeat(200 * 1024) }] },
+      ],
+    })
+
+    const msg = payload.conversationState.currentMessage.userInputMessage as Record<string, unknown>
+    const ctx = msg['userInputMessageContext'] as { toolResults: { content: { text: string }[] }[] }
+    const text = ctx.toolResults[0]!.content[0]!.text
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(128 * 1024)
+    expect(text).toContain('[tool_result truncated:')
+  })
+
+  it('extracts Anthropic tool_result image blocks without stringifying base64', () => {
+    const payload = anthropicToKiro({
+      model: 'claude-sonnet-4.6',
+      messages: [
+        { role: 'user', content: 'read screenshot' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_image', name: 'read_file', input: { path: 'shot.png' } }] },
+        {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'tu_image',
+            content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc' } }],
+          }],
+        },
+      ],
+    })
+
+    const msg = payload.conversationState.currentMessage.userInputMessage as Record<string, unknown>
+    expect(msg['images']).toEqual([{ format: 'png', source: { bytes: 'abc' } }])
+    const ctx = msg['userInputMessageContext'] as { toolResults: { content: { text: string }[] }[] }
+    expect(ctx.toolResults[0]!.content[0]!.text).toBe('[Tool returned an image; the image is attached to this message.]')
+    expect(ctx.toolResults[0]!.content[0]!.text).not.toContain('abc')
+  })
+
+  it('keeps tool_result images on history turns for multi-turn follow-ups', () => {
+    const payload = anthropicToKiro({
+      model: 'claude-sonnet-4.6',
+      messages: [
+        { role: 'user', content: 'read screenshot' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_image', name: 'read_file', input: { path: 'shot.png' } }] },
+        {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'tu_image',
+            content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'YWJj' } }],
+          }],
+        },
+        { role: 'assistant', content: 'I see the screenshot.' },
+        { role: 'user', content: 'what color is the button?' },
+      ],
+    })
+
+    const historyUserWithTool = payload.conversationState.history.find((entry) => {
+      if (!entry || typeof entry !== 'object' || !('userInputMessage' in entry)) return false
+      const uim = (entry as { userInputMessage: Record<string, unknown> }).userInputMessage
+      const ctx = uim['userInputMessageContext'] as { toolResults?: unknown[] } | undefined
+      return Array.isArray(ctx?.toolResults) && ctx.toolResults.length > 0
+    }) as { userInputMessage: Record<string, unknown> } | undefined
+
+    expect(historyUserWithTool).toBeDefined()
+    expect(historyUserWithTool!.userInputMessage['images']).toEqual([{ format: 'png', source: { bytes: 'YWJj' } }])
   })
 
   it('preserves Anthropic tool_result errors for Kiro', () => {

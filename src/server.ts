@@ -35,14 +35,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, config: ProxyCo
     if (req.method === 'POST' && path === '/v1/messages/count_tokens') { const r = await body<AnthropicRequest>(req, config.maxBodyBytes); json(res, 200, { input_tokens: Math.max(1, Math.ceil(JSON.stringify(r).length / 4)) }); return }
     if (req.method === 'POST' && path === '/v1/messages') {
       const request = await body<AnthropicRequest>(req, config.maxBodyBytes)
-      log(`  → model=${request.model} stream=${request.stream} tools=${request.tools?.length ?? 0}`)
+      log(`  → model=${request.model} stream=${request.stream} tools=${request.tools?.length ?? 0} messages=${request.messages?.length ?? 0}`)
       const ac = new AbortController(); req.on('close', () => ac.abort()); await handleMessages(res, request, log, ac.signal)
       return
     }
 
     if (req.method === 'POST' && path === '/v1/chat/completions') {
       const request = await body<OpenAIRequest>(req, config.maxBodyBytes)
-      log(`  → model=${request.model} stream=${request.stream} tools=${request.tools?.length ?? 0}`)
+      log(`  → model=${request.model} stream=${request.stream} tools=${request.tools?.length ?? 0} messages=${request.messages?.length ?? 0}`)
       const ac2 = new AbortController(); req.on('close', () => ac2.abort()); await handleOpenAI(res, request, log, ac2.signal)
       return
     }

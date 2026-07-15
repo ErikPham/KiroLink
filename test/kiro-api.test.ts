@@ -1,9 +1,9 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { normalizeKiroStreamEvent, normalizeToolInputForClient, repairKiroToolResultPairing, resolveKiroApiUrl, resolveTokenPath, truncatePayload, validateToken } from '../src/kiro-api'
+import { normalizeKiroStreamEvent, normalizeToolInputForClient, repairKiroToolResultPairing, requestTimeoutMs, resolveKiroApiUrl, resolveTokenPath, truncatePayload, validateToken } from '../src/kiro-api'
 import { RuntimeApiError } from '../src/errors'
 
 const MAX_PAYLOAD_BYTES = 900 * 1024
@@ -127,6 +127,29 @@ describe('payload truncation', () => {
   })
 })
 
+describe('runtime request timeout', () => {
+  const savedTimeout = process.env['KIRO_PROXY_REQUEST_TIMEOUT_MS']
+  beforeEach(() => { delete process.env['KIRO_PROXY_REQUEST_TIMEOUT_MS'] })
+  afterEach(() => {
+    if (savedTimeout === undefined) delete process.env['KIRO_PROXY_REQUEST_TIMEOUT_MS']
+    else process.env['KIRO_PROXY_REQUEST_TIMEOUT_MS'] = savedTimeout
+  })
+
+  it('defaults to a 10-minute runtime timeout', () => {
+    expect(requestTimeoutMs()).toBe(10 * 60_000)
+  })
+
+  it('honors KIRO_PROXY_REQUEST_TIMEOUT_MS when valid', () => {
+    process.env['KIRO_PROXY_REQUEST_TIMEOUT_MS'] = '90000'
+    expect(requestTimeoutMs()).toBe(90_000)
+  })
+
+  it('ignores invalid timeout overrides below 30s', () => {
+    process.env['KIRO_PROXY_REQUEST_TIMEOUT_MS'] = '15000'
+    expect(requestTimeoutMs()).toBe(10 * 60_000)
+  })
+})
+
 describe('client tool input compatibility', () => {
   it('normalizes Kiro-style question choices into Claude Code AskUserQuestion input', () => {
     const input = normalizeToolInputForClient('AskUserQuestion', {
@@ -138,6 +161,7 @@ describe('client tool input compatibility', () => {
       questions: [{
         question: 'Pick an approach?',
         header: 'Pick an appr',
+        id: 'pick_an_approach',
         options: [
           { label: 'Fast path', description: 'Fast path' },
           { label: 'Safe path', description: 'More validation' },
@@ -156,11 +180,35 @@ describe('client tool input compatibility', () => {
       }],
     })
 
-    expect(input).toMatchObject({
+    expect(input).toEqual({
       questions: [{
         question: 'Which one?',
         header: 'Choice',
+        id: 'which_one',
         options: [{ label: 'A', description: 'First' }, { label: 'B', description: 'Second' }],
+        multiSelect: false,
+      }],
+    })
+  })
+
+  it('preserves explicit question ids for Claude Code question tools', () => {
+    const input = normalizeToolInputForClient('ask_user_question', {
+      questions: [{
+        question: 'Please choose an option?',
+        id: 'lcp_slide_choice',
+        choices: ['Đào LCP slide #5', 'Bỏ qua'],
+      }],
+    })
+
+    expect(input).toEqual({
+      questions: [{
+        id: 'lcp_slide_choice',
+        question: 'Please choose an option?',
+        header: 'Please choos',
+        options: [
+          { label: 'Đào LCP slide #5', description: 'Đào LCP slide #5' },
+          { label: 'Bỏ qua', description: 'Bỏ qua' },
+        ],
         multiSelect: false,
       }],
     })

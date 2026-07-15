@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { KiroPayload, KiroToolUse } from './kiro-api'
 import { InvalidRequestError } from './errors'
 
@@ -42,6 +42,7 @@ const KIRO_ORIGIN = 'KIRO_CLI'
 const SYNTHETIC_IMAGE_TOOL_NAME = 'fs_read'
 const SYNTHETIC_IMAGE_TOOL_RESULT_TEXT = 'See images data supplied'
 const SYNTHETIC_IMAGE_PLACEHOLDER_PREFIX = '/tmp/kirolink-image'
+const TOOL_RESULT_IMAGE_PLACEHOLDER = '[Tool returned an image; the image is attached to this message.]'
 
 type KiroImage = { format: string; source: { bytes: string } }
 
@@ -67,26 +68,28 @@ export function anthropicToKiro(req: AnthropicRequest): KiroPayload {
   // Flatten messages into alternating user/assistant for Kiro history
   // Claude Code sends: user, assistant(tool_use), user(tool_result), assistant, ...
   // Kiro expects: strict alternating userInputMessage / assistantResponseMessage
-  const flat: { role: 'user' | 'assistant'; text: string; images: KiroImage[]; toolUses: KiroToolUse[]; toolResults: unknown[] }[] = []
+  const flat: { role: 'user' | 'assistant'; text: string; images: KiroImage[]; nativeImages: KiroImage[]; toolUses: KiroToolUse[]; toolResults: unknown[] }[] = []
 
   for (const msg of messages) {
     const text = extractText(msg.content)
     const images = msg.role === 'user' ? extractImages(msg.content) : []
+    const nativeImages: KiroImage[] = []
     const toolUses = msg.role === 'assistant' ? extractToolUses(msg.content, seenToolUseIds, requestNameMap) : []
-    const toolResults = msg.role === 'user' ? extractToolResults(msg.content, seenToolUseIds, 'Anthropic') : []
+    const toolResults = msg.role === 'user' ? extractToolResults(msg.content, seenToolUseIds, 'Anthropic', nativeImages) : []
 
     // Merge consecutive same-role messages
     const last = flat[flat.length - 1]
     if (last && last.role === msg.role) {
       if (text) last.text += '\n' + text
       last.images.push(...images)
+      last.nativeImages.push(...nativeImages)
       last.toolUses.push(...toolUses)
       last.toolResults.push(...toolResults)
     } else {
-      flat.push({ role: msg.role, text, images, toolUses, toolResults })
+      flat.push({ role: msg.role, text, images, nativeImages, toolUses, toolResults })
     }
   }
-  repairMissingToolResults(flat, (toolResults) => ({ role: 'user', text: 'Continue.', images: [], toolUses: [], toolResults }))
+  repairMissingToolResults(flat, (toolResults) => ({ role: 'user', text: 'Continue.', images: [], nativeImages: [], toolUses: [], toolResults }))
 
   // Build history from all except last entry
   const history: unknown[] = []
@@ -95,15 +98,22 @@ export function anthropicToKiro(req: AnthropicRequest): KiroPayload {
     if (entry.role === 'user') {
       const imageToolUse = entry.images.length ? buildSyntheticImageToolUse(entry.images) : undefined
       if (imageToolUse) {
-        history.push({ userInputMessage: { content: syntheticImagePlaceholderContent(entry.images), userInputMessageContext: { envState: buildEnvState() }, origin: KIRO_ORIGIN, modelId } })
+        history.push({ userInputMessage: { content: syntheticImagePlaceholderContent(entry.images), origin: KIRO_ORIGIN, modelId } })
         history.push({ assistantResponseMessage: { content: '', toolUses: [imageToolUse] } })
       }
       const content = i === 0 && effectiveSystem ? `${effectiveSystem}\n\n${entry.text}` : entry.text
-      const ctx: Record<string, unknown> = { envState: buildEnvState() }
       const toolResults = imageToolUse ? [buildSyntheticImageToolResult(imageToolUse.toolUseId), ...entry.toolResults] : entry.toolResults
-      if (toolResults.length) ctx['toolResults'] = toolResults
-      const uim: Record<string, unknown> = { content: content || 'Continue.', userInputMessageContext: ctx, origin: KIRO_ORIGIN, modelId }
-      if (entry.images.length) uim['images'] = entry.images
+      // Kiro CLI sends history user turns with user_input_message_context = null;
+      // only attach context when it carries tool results that must pair with a
+      // prior assistant tool use. Omitting envState here trims the payload that is
+      // re-sent every turn and keeps the shape closer to real Kiro CLI traffic.
+      const uim: Record<string, unknown> = { content: content || 'Continue.', origin: KIRO_ORIGIN, modelId }
+      if (toolResults.length) uim['userInputMessageContext'] = { toolResults }
+      // Match current-turn behavior: top-level message images + images extracted
+      // from tool_result blocks must both stay attached on multi-turn history.
+      const historyImages = [...entry.images, ...entry.nativeImages]
+      if (historyImages.length > MAX_IMAGES) throw new InvalidRequestError(`image count exceeds ${MAX_IMAGES}`)
+      if (historyImages.length) uim['images'] = historyImages
       history.push({ userInputMessage: uim })
     } else {
       history.push({ assistantResponseMessage: { content: entry.text, toolUses: entry.toolUses } })
@@ -114,10 +124,11 @@ export function anthropicToKiro(req: AnthropicRequest): KiroPayload {
   const last = flat[flat.length - 1]
   const userContent = last?.role === 'user' ? last.text : ''
   const currentImages = last?.role === 'user' ? last.images : []
+  const currentNativeImages = last?.role === 'user' ? last.nativeImages : []
   const lastToolResults = last?.role === 'user' ? last.toolResults : []
   const currentImageToolUse = last?.role === 'user' && currentImages.length ? buildSyntheticImageToolUse(currentImages) : undefined
   if (currentImageToolUse) {
-    history.push({ userInputMessage: { content: syntheticImagePlaceholderContent(currentImages), userInputMessageContext: { envState: buildEnvState() }, origin: KIRO_ORIGIN, modelId } })
+    history.push({ userInputMessage: { content: syntheticImagePlaceholderContent(currentImages), origin: KIRO_ORIGIN, modelId } })
     history.push({ assistantResponseMessage: { content: '', toolUses: [currentImageToolUse] } })
   }
   const fullContent = (flat.length === 1 || flat[0]?.role !== 'user') && effectiveSystem
@@ -130,11 +141,16 @@ export function anthropicToKiro(req: AnthropicRequest): KiroPayload {
   if (currentToolResults.length) userMsgCtx['toolResults'] = currentToolResults
 
   const currentUim: Record<string, unknown> = { content: fullContent, userInputMessageContext: userMsgCtx, origin: KIRO_ORIGIN, modelId }
-  if (currentImages.length) currentUim['images'] = currentImages
+  const combinedImages = [...currentImages, ...currentNativeImages]
+  if (combinedImages.length > MAX_IMAGES) throw new InvalidRequestError(`image count exceeds ${MAX_IMAGES}`)
+  if (combinedImages.length) currentUim['images'] = combinedImages
+
+  const anchorMessage = messages.find((m) => m.role === 'user')
+  const anchor = anchorMessage ? extractText(anchorMessage.content) : ''
 
   return {
     conversationState: {
-      conversationId: stableConversationId(),
+      conversationId: stableConversationId(modelId, effectiveSystem, anchor),
       history,
       currentMessage: { userInputMessage: currentUim },
       chatTriggerType: 'MANUAL',
@@ -147,7 +163,62 @@ export function anthropicToKiro(req: AnthropicRequest): KiroPayload {
   }
 }
 
-function stableConversationId(): string { return randomUUID() }
+// Kiro CLI assigns a fresh RANDOM conversationId when a session starts and keeps
+// it stable for every turn of that session (confirmed from real Kiro CLI runtime
+// recordings: each invocation uses a different random UUID, history user turns have
+// context=null / model_id=null, agent_continuation_id=null). The backend rewards a
+// stable id with prefix-cache reuse (observed TTFB dropping across turns).
+//
+// We are stateless per HTTP request, so to reproduce Kiro CLI exactly we remember a
+// random id per conversation in-process, keyed by the conversation's immutable
+// anchor (model + system + first user message). This mirrors Kiro CLI (random id,
+// stable within a session) without deriving a globally-deterministic id. Short,
+// empty (e.g. image-only first turn), or synthetic first texts are collision-prone
+// and get an ephemeral random id that is never stored or shared. Set
+// KIRO_PROXY_RANDOM_CONVERSATION_ID=1 to force pure random everywhere.
+const MIN_ANCHOR_LENGTH = 32
+const CONVERSATION_CACHE_MAX = 1000
+const conversationIdCache = new Map<string, string>() // anchor fingerprint -> random conversationId
+
+function stableConversationId(modelId: string, system: string, firstText: string): string {
+  if (process.env['KIRO_PROXY_RANDOM_CONVERSATION_ID'] === '1') return randomUUID()
+  const anchor = firstText.replace(/\s+/gu, ' ').trim()
+  if (anchor.length < MIN_ANCHOR_LENGTH || isSyntheticConversationAnchor(anchor)) return randomUUID()
+
+  const key = createHash('sha1')
+    .update(modelId).update('\n')
+    .update(system.trim()).update('\n')
+    .update(anchor.slice(0, 4096))
+    .digest('hex')
+
+  const existing = conversationIdCache.get(key)
+  if (existing !== undefined) {
+    // Refresh recency (Map preserves insertion order → move to newest).
+    conversationIdCache.delete(key)
+    conversationIdCache.set(key, existing)
+    return existing
+  }
+
+  const id = randomUUID()
+  conversationIdCache.set(key, id)
+  if (conversationIdCache.size > CONVERSATION_CACHE_MAX) {
+    const oldest = conversationIdCache.keys().next().value
+    if (oldest !== undefined) conversationIdCache.delete(oldest)
+  }
+  return id
+}
+
+function isSyntheticConversationAnchor(anchor: string): boolean {
+  switch (anchor.toLowerCase()) {
+    case '':
+    case '.':
+    case 'continue.':
+    case 'begin conversation':
+      return true
+    default:
+      return false
+  }
+}
 
 function mapModelId(model: string): string {
   if (typeof model !== 'string' || !model) throw new InvalidRequestError('model is required')
@@ -197,14 +268,7 @@ function extractImages(content: string | AnthropicContentBlock[]): KiroImage[] {
   const imageBlocks = content.filter((b) => b.type === 'image' && 'source' in b)
   if (imageBlocks.length > MAX_IMAGES) throw new InvalidRequestError(`image count exceeds ${MAX_IMAGES}`)
 
-  return imageBlocks.map((b) => {
-    const src = (b as { source: { type?: string; media_type: string; data: string } }).source
-    if (src.type && src.type !== 'base64') throw new InvalidRequestError('only base64 image sources are supported')
-    if (!IMAGE_MEDIA_TYPES.has(src.media_type)) throw new InvalidRequestError(`unsupported image media type: ${src.media_type}`)
-    if (typeof src.data !== 'string' || !isLikelyBase64(src.data)) throw new InvalidRequestError('image source must be base64 data')
-    const format = src.media_type === 'image/jpeg' ? 'jpeg' : src.media_type.split('/')[1] || 'png'
-    return { format, source: { bytes: src.data } }
-  })
+  return imageBlocks.map(extractImageBlock)
 }
 
 function hasAnthropicImageInput(messages: AnthropicMessage[]): boolean {
@@ -273,12 +337,12 @@ function extractToolUses(content: string | AnthropicContentBlock[], seenToolUseI
   })
 }
 
-function extractToolResults(content: string | AnthropicContentBlock[] | undefined, seenToolUseIds: Set<string>, source: string): unknown[] {
+function extractToolResults(content: string | AnthropicContentBlock[] | undefined, seenToolUseIds: Set<string>, source: string, images?: KiroImage[]): unknown[] {
   if (!content || typeof content === 'string') return []
   return content.filter((b) => b.type === 'tool_result').map((b) => {
     const tr = b as { tool_use_id: string; content: unknown; is_error?: boolean }
     validateKnownToolResultId(tr.tool_use_id, seenToolUseIds, source)
-    return { toolUseId: tr.tool_use_id, content: [{ text: stringifyToolResultContent(tr.content, source) }], status: tr.is_error ? 'error' : 'success' }
+    return { toolUseId: tr.tool_use_id, content: [{ text: stringifyToolResultContent(tr.content, source, images) }], status: tr.is_error ? 'error' : 'success' }
   })
 }
 
@@ -412,9 +476,9 @@ export function openaiToKiro(req: OpenAIRequest): KiroPayload {
   for (let i = 0; i < flat.length - 1; i++) {
     const entry = flat[i]!
     if (entry.role === 'user') {
-      const ctx: Record<string, unknown> = { envState: buildEnvState() }
-      if (entry.toolResults.length) ctx['toolResults'] = entry.toolResults
-      history.push({ userInputMessage: { content: entry.text || 'Continue.', userInputMessageContext: ctx, origin: KIRO_ORIGIN, modelId } })
+      const uim: Record<string, unknown> = { content: entry.text || 'Continue.', origin: KIRO_ORIGIN, modelId }
+      if (entry.toolResults.length) uim['userInputMessageContext'] = { toolResults: entry.toolResults }
+      history.push({ userInputMessage: uim })
     } else {
       history.push({ assistantResponseMessage: { content: entry.text, toolUses: entry.toolUses } })
     }
@@ -432,9 +496,11 @@ export function openaiToKiro(req: OpenAIRequest): KiroPayload {
   if (tools.length) userMsgCtx['tools'] = tools
   if (toolResults.length) userMsgCtx['toolResults'] = toolResults
 
+  const anchor = msgs.find((m) => m.role === 'user')?.content ?? ''
+
   return {
     conversationState: {
-      conversationId: stableConversationId(),
+      conversationId: stableConversationId(modelId, effectiveSystem, anchor),
       history,
       currentMessage: { userInputMessage: { content: fullContent, userInputMessageContext: userMsgCtx, origin: KIRO_ORIGIN, modelId } },
       chatTriggerType: 'MANUAL',
@@ -612,11 +678,73 @@ function parseToolInput(value: string, id: string): Record<string, unknown> {
   }
 }
 
-function stringifyToolResultContent(content: unknown, source: string): string {
+function stringifyToolResultContent(content: unknown, source: string, images?: KiroImage[]): string {
+  if (Array.isArray(content)) return stringifyToolResultParts(content, source, images)
   const text = typeof content === 'string' ? content : JSON.stringify(content)
   if (typeof text !== 'string') throw new InvalidRequestError(`${source} tool_result content is not serializable`)
-  if (Buffer.byteLength(text) > MAX_TOOL_RESULT_TEXT_BYTES) throw new InvalidRequestError(`${source} tool_result content is too large`)
-  return text
+  return truncateToolResultText(text)
+}
+
+function stringifyToolResultParts(parts: unknown[], source: string, images?: KiroImage[]): string {
+  const textParts: string[] = []
+  let imageCount = 0
+  for (const part of parts) {
+    if (isRecord(part) && part['type'] === 'text' && typeof part['text'] === 'string') {
+      textParts.push(part['text'])
+      continue
+    }
+    if (isImageBlock(part)) {
+      if (!images) {
+        textParts.push(TOOL_RESULT_IMAGE_PLACEHOLDER)
+      } else {
+        if (images.length >= MAX_IMAGES) throw new InvalidRequestError(`image count exceeds ${MAX_IMAGES}`)
+        images.push(extractImageBlock(part))
+      }
+      imageCount++
+      continue
+    }
+    const text = stringifyToolResultContent(part, source)
+    if (text) textParts.push(text)
+  }
+  if (textParts.length) return truncateToolResultText(textParts.join('\n'))
+  return imageCount > 0 ? TOOL_RESULT_IMAGE_PLACEHOLDER : ''
+}
+
+function isImageBlock(value: unknown): boolean {
+  return isRecord(value) && value['type'] === 'image' && isRecord(value['source'])
+}
+
+function extractImageBlock(block: unknown): KiroImage {
+  if (!isRecord(block) || !isRecord(block['source'])) throw new InvalidRequestError('image block is invalid')
+  const src = block['source']
+  const sourceType = src['type']
+  if (sourceType && sourceType !== 'base64') throw new InvalidRequestError('only base64 image sources are supported')
+  const mediaType = src['media_type']
+  const data = src['data']
+  if (typeof mediaType !== 'string' || !IMAGE_MEDIA_TYPES.has(mediaType)) throw new InvalidRequestError(`unsupported image media type: ${String(mediaType)}`)
+  if (typeof data !== 'string' || !isLikelyBase64(data)) throw new InvalidRequestError('image source must be base64 data')
+  const format = mediaType === 'image/jpeg' ? 'jpeg' : mediaType.split('/')[1] || 'png'
+  return { format, source: { bytes: data } }
+}
+
+function truncateToolResultText(text: string): string {
+  const bytes = Buffer.byteLength(text)
+  if (bytes <= MAX_TOOL_RESULT_TEXT_BYTES) return text
+  const suffix = `\n[tool_result truncated: original_bytes=${bytes}]`
+  const budget = Math.max(0, MAX_TOOL_RESULT_TEXT_BYTES - Buffer.byteLength(suffix))
+  return `${truncateUtf8(text, budget)}${suffix}`
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return ''
+  let low = 0
+  let high = value.length
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2)
+    if (Buffer.byteLength(value.slice(0, mid)) <= maxBytes) low = mid
+    else high = mid - 1
+  }
+  return value.slice(0, low)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

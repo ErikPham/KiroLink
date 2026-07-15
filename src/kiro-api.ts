@@ -18,18 +18,19 @@ const MAX_PAYLOAD_BYTES = 900 * 1024
 const MAX_RETRIES = 2
 const RETRY_DELAY_MS = 1000
 const MAX_RETRY_AFTER_MS = 60_000
-const REQUEST_TIMEOUT_MS = 120_000
+const DEFAULT_REQUEST_TIMEOUT_MS = 10 * 60_000
 const MAX_ERROR_BODY_BYTES = 16 * 1024
 const MAX_CONTENT_TEXT_BYTES = 128 * 1024
 const MAX_TOOL_RESULT_TEXT_BYTES = 64 * 1024
 
 export let verbose = false
 export function setVerbose(v: boolean): void { verbose = v }
-function debug(msg: string): void { if (verbose) process.stderr.write(msg + '\n') }
+export function debug(msg: string): void { if (verbose) process.stderr.write(msg + '\n') }
 
 // Token cache + refresh mutex
 let cachedToken: KiroToken | null = null
 let refreshPromise: Promise<void> | null = null
+let runtimeRequestSeq = 0
 
 export type KiroToken = { accessToken: string; refreshToken: string; expiresAt: string; profileArn: string }
 export type KiroToolUse = { toolUseId: string; name: string; input: Record<string, unknown> }
@@ -173,6 +174,8 @@ function refreshTokenViaCli(): Promise<void> {
 }
 
 export async function callKiroApi(payload: KiroPayload, onEvent: (event: KiroStreamEvent) => void, signal?: AbortSignal): Promise<void> {
+  const requestId = ++runtimeRequestSeq
+  const tStart = Date.now()
   // Truncate payload if too large
   truncatePayload(payload)
   let pairingRepairs = repairKiroToolResultPairing(payload)
@@ -180,6 +183,9 @@ export async function callKiroApi(payload: KiroPayload, onEvent: (event: KiroStr
     truncatePayload(payload)
     pairingRepairs = mergeToolPairingRepairStats(pairingRepairs, repairKiroToolResultPairing(payload))
   }
+  const prepMs = Date.now() - tStart
+  let retryCount = 0
+  let retryWaitMs = 0
   const toolNameMap = payload.toolNameMap
   delete payload.toolNameMap
 
@@ -195,13 +201,19 @@ export async function callKiroApi(payload: KiroPayload, onEvent: (event: KiroStr
     : onEvent
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const authStart = Date.now()
     const token = await loadToken()
+    const authMs = Date.now() - authStart
     payload.profileArn = token.profileArn
+    const jsonStart = Date.now()
     const body = JSON.stringify(payload)
-    debug(`[runtime] request ${summarizeKiroPayload(payload, body, pairingRepairs)}`)
+    const jsonMs = Date.now() - jsonStart
+    if (verbose) debug(`[runtime] request rid=${requestId} ${summarizeKiroPayload(payload, body, pairingRepairs)} prep=${prepMs}ms auth=${authMs}ms json=${jsonMs}ms before_send=${Date.now() - tStart}ms`)
 
     if (!token.profileArn) throw new Error('Kiro token does not contain profileArn')
 
+    const timeoutMs = requestTimeoutMs()
+    let sentAt = 0
     const resp = await new Promise<IncomingMessage>((resolve, reject) => {
       if (signal?.aborted) { reject(new Error('Request aborted')); return }
       const url = resolveKiroApiUrl()
@@ -218,15 +230,20 @@ export async function callKiroApi(payload: KiroPayload, onEvent: (event: KiroStr
         'Accept': '*/*',
       } }, resolve)
       req.on('error', reject)
-      req.setTimeout(REQUEST_TIMEOUT_MS, () => req.destroy(new Error('Kiro API request timed out')))
+      req.setTimeout(timeoutMs, () => req.destroy(new Error(`Kiro API request timed out after ${timeoutMs}ms`)))
       signal?.addEventListener('abort', () => req.destroy(new Error('Request aborted')), { once: true })
+      sentAt = Date.now()
       req.end(body)
     })
+    const headersMs = Date.now() - sentAt
+    if (verbose) debug(`[runtime] headers rid=${requestId} status=${resp.statusCode ?? 0} after=${headersMs}ms body_bytes=${Buffer.byteLength(body)}`)
 
     if (resp.statusCode === 429 && attempt < MAX_RETRIES) {
       const retryAfterMs = parseRetryAfterMs(resp.headers['retry-after'])
       await consume(resp)
       const delay = retryAfterMs ?? RETRY_DELAY_MS * (attempt + 1)
+      retryCount++
+      retryWaitMs += delay
       debug(`[retry] 429 rate limited, waiting ${delay}ms...`)
       await sleep(delay)
       continue
@@ -236,6 +253,7 @@ export async function callKiroApi(payload: KiroPayload, onEvent: (event: KiroStr
       // Token might have just expired between check and use
       await consume(resp)
       cachedToken = null
+      retryCount++
       debug('[retry] 403, forcing token refresh...')
       await refreshTokenSerialized()
       continue
@@ -243,18 +261,81 @@ export async function callKiroApi(payload: KiroPayload, onEvent: (event: KiroStr
 
     if (resp.statusCode !== 200) {
       const errBody = await consumeText(resp, MAX_ERROR_BODY_BYTES)
-      debug(`[runtime] failed request ${summarizeKiroPayload(payload, body, pairingRepairs)}`)
-      debug(`[runtime] upstream ${resp.statusCode ?? 500}: ${errBody}`)
+      if (verbose) {
+        debug(`[runtime] failed request rid=${requestId} ${summarizeKiroPayload(payload, body, pairingRepairs)} prep=${prepMs}ms auth=${authMs}ms json=${jsonMs}ms before_send=${sentAt - tStart}ms headers=${headersMs}ms`)
+        debug(`[runtime] upstream rid=${requestId} ${resp.statusCode ?? 500}: ${errBody}`)
+      }
       if (process.env['KIRO_PROXY_DUMP_FAILED_PAYLOAD'] === '1') {
         await writeFile(process.env['KIRO_PROXY_FAILED_PAYLOAD_PATH'] ?? join(tmpdir(), 'kiro-failed-payload.json'), JSON.stringify(payload, null, 2), { mode: 0o600 })
       }
       throw new RuntimeApiError(resp.statusCode ?? 500, errBody, retryAfterSeconds(resp.headers['retry-after']))
     }
 
-    await parseEventStream(resp, wrappedOnEvent)
+    let firstEventAt = 0
+    let firstTextAt = 0
+    let firstToolUseAt = 0
+    let doneAt = 0
+    let eventCount = 0
+    let thinkBytes = 0
+    let textBytes = 0
+    let toolUses = 0
+    let inputTokens = 0
+    let outputTokens = 0
+    const timedOnEvent = (event: KiroStreamEvent): void => {
+      const now = Date.now()
+      if (!firstEventAt) {
+        firstEventAt = now
+        if (verbose) debug(`[runtime] first_event rid=${requestId} type=${event.type} after=${now - sentAt}ms`)
+      }
+      eventCount++
+      if (event.type === 'thinking') thinkBytes += Buffer.byteLength(event.text)
+      else if (event.type === 'text') {
+        textBytes += Buffer.byteLength(event.text)
+        if (!firstTextAt) {
+          firstTextAt = now
+          if (verbose) debug(`[runtime] first_text rid=${requestId} after=${now - sentAt}ms`)
+        }
+      }
+      else if (event.type === 'tool_use') {
+        toolUses++
+        if (!firstToolUseAt) {
+          firstToolUseAt = now
+          if (verbose) debug(`[runtime] first_tool_use rid=${requestId} after=${now - sentAt}ms name=${event.toolUse.name}`)
+        }
+      }
+      else if (event.type === 'done') {
+        doneAt = now
+        inputTokens = event.inputTokens
+        outputTokens = event.outputTokens
+      }
+      wrappedOnEvent(event)
+    }
+    await parseEventStream(resp, timedOnEvent)
+    const endAt = Date.now()
+    const ttfbMs = (firstEventAt || endAt) - sentAt
+    const streamMs = firstEventAt ? endAt - firstEventAt : 0
+    const thinkMs = firstTextAt && firstEventAt ? firstTextAt - firstEventAt : 0
+    const firstTextMs = firstTextAt ? firstTextAt - sentAt : 0
+    const firstToolUseMs = firstToolUseAt ? firstToolUseAt - sentAt : 0
+    const doneMs = doneAt ? doneAt - sentAt : 0
+    const tailMs = doneAt ? endAt - doneAt : 0
+    if (verbose) debug(`[runtime] timing rid=${requestId} prep=${prepMs}ms auth=${authMs}ms json=${jsonMs}ms before_send=${sentAt - tStart}ms headers=${headersMs}ms first_event=${ttfbMs}ms first_text=${firstTextMs}ms first_tool_use=${firstToolUseMs}ms think=${thinkMs}ms done=${doneMs}ms stream=${streamMs}ms tail=${tailMs}ms upstream_total=${endAt - sentAt}ms wall=${endAt - tStart}ms events=${eventCount} think_bytes=${thinkBytes} text_bytes=${textBytes} tool_uses=${toolUses} input_tokens=${inputTokens} output_tokens=${outputTokens} retries=${retryCount} retry_wait=${retryWaitMs}ms`)
     return
   }
   throw new Error('Max retries exceeded')
+}
+
+export function requestTimeoutMs(): number {
+  const override = readTimeoutOverride('KIRO_PROXY_REQUEST_TIMEOUT_MS')
+  if (override !== undefined) return override
+  return DEFAULT_REQUEST_TIMEOUT_MS
+}
+
+function readTimeoutOverride(name: string): number | undefined {
+  const raw = process.env[name]
+  if (!raw) return undefined
+  const value = Number(raw)
+  return Number.isFinite(value) && value >= 30_000 ? Math.floor(value) : undefined
 }
 
 export function resolveKiroApiUrl(): URL {
@@ -381,21 +462,100 @@ function summarizeKiroPayload(payload: KiroPayload, body: string, repairs: ToolP
   const current = payload.conversationState.currentMessage.userInputMessage
   const currentRecord = isRecord(current) ? current : {}
   const context = isRecord(currentRecord['userInputMessageContext']) ? currentRecord['userInputMessageContext'] : {}
-  const tools = Array.isArray(context['tools']) ? context['tools'].length : 0
-  const currentToolResults = Array.isArray(context['toolResults']) ? context['toolResults'].length : 0
+  const tools = Array.isArray(context['tools']) ? context['tools'] : []
+  const currentToolResults = Array.isArray(context['toolResults']) ? context['toolResults'] : []
+  const currentImages = Array.isArray(currentRecord['images']) ? currentRecord['images'] : []
+  const historyPayload = summarizeHistoryPayload(payload.conversationState.history)
   const content = typeof currentRecord['content'] === 'string' ? currentRecord['content'] : ''
   const fields = [
     `body_bytes=${Buffer.byteLength(body)}`,
     `modelId=${String(currentRecord['modelId'] ?? '')}`,
     `history_len=${payload.conversationState.history.length}`,
     `current_content_bytes=${Buffer.byteLength(content)}`,
-    `tools=${tools}`,
-    `current_tool_results=${currentToolResults}`,
+    `tools=${tools.length}`,
+    `tools_bytes=${collectionJsonBytes(tools)}`,
+    `top_tool_bytes=${summarizeTopToolBytes(tools)}`,
+    `current_tool_results=${currentToolResults.length}`,
+    `current_tool_result_bytes=${toolResultTextBytes(currentToolResults)}`,
+    `history_tool_result_bytes=${historyPayload.toolResultBytes}`,
+    `current_images=${currentImages.length}`,
+    `current_image_bytes=${imageBytes(currentImages)}`,
+    `history_images=${historyPayload.images}`,
+    `history_image_bytes=${historyPayload.imageBytes}`,
     `repairs=missing:${repairs.addedMissingResults},orphan:${repairs.removedOrphanResults}`,
     `history_head=${summarizeHistoryHead(payload.conversationState.history)}`,
     `history_tail=${summarizeHistoryTail(payload.conversationState.history)}`,
   ]
   return fields.join(' ')
+}
+
+function summarizeHistoryPayload(history: unknown[]): { toolResultBytes: number; images: number; imageBytes: number } {
+  let toolResultBytes = 0
+  let images = 0
+  let imageByteTotal = 0
+  for (const entry of history) {
+    if (!isRecord(entry)) continue
+    const user = entry['userInputMessage']
+    if (!isRecord(user)) continue
+    const context = isRecord(user['userInputMessageContext']) ? user['userInputMessageContext'] : {}
+    if (Array.isArray(context['toolResults'])) toolResultBytes += toolResultTextBytes(context['toolResults'])
+    const userImages = Array.isArray(user['images']) ? user['images'] : []
+    images += userImages.length
+    imageByteTotal += imageBytes(userImages)
+  }
+  return { toolResultBytes, images, imageBytes: imageByteTotal }
+}
+
+function summarizeTopToolBytes(tools: unknown[]): string {
+  const ranked = tools
+    .map((tool) => ({ name: toolName(tool), bytes: jsonBytes(tool) }))
+    .sort((a, b) => b.bytes - a.bytes)
+    .slice(0, 5)
+  return ranked.length ? ranked.map((tool) => `${tool.name}:${tool.bytes}`).join(',') : 'none'
+}
+
+function toolName(tool: unknown): string {
+  if (!isRecord(tool)) return 'unknown'
+  const spec = tool['toolSpecification'] ?? tool['ToolSpecification']
+  if (isRecord(spec) && typeof spec['name'] === 'string') return spec['name']
+  return 'unknown'
+}
+
+function collectionJsonBytes(values: unknown[]): number {
+  return values.reduce<number>((sum, value) => sum + jsonBytes(value), 0)
+}
+
+function jsonBytes(value: unknown): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(value))
+  } catch {
+    return 0
+  }
+}
+
+function toolResultTextBytes(results: unknown[]): number {
+  let bytes = 0
+  for (const result of results) {
+    if (!isRecord(result) || !Array.isArray(result['content'])) continue
+    for (const block of result['content']) {
+      if (isRecord(block) && typeof block['text'] === 'string') bytes += Buffer.byteLength(block['text'])
+      else bytes += jsonBytes(block)
+    }
+  }
+  return bytes
+}
+
+function imageBytes(images: unknown[]): number {
+  let bytes = 0
+  for (const image of images) {
+    if (!isRecord(image) || !isRecord(image['source'])) {
+      bytes += jsonBytes(image)
+      continue
+    }
+    const rawBytes = image['source']['bytes']
+    bytes += typeof rawBytes === 'string' ? Buffer.byteLength(rawBytes) : jsonBytes(image)
+  }
+  return bytes
 }
 
 function summarizeHistoryHead(history: unknown[]): string {
@@ -674,6 +834,7 @@ export function normalizeToolInputForClient(name: string, input: Record<string, 
     questions: [{
       question: ensureQuestionMark(question),
       header: shortHeader(readString(input, 'header') ?? question),
+      id: questionId(input, question, 0),
       options,
       multiSelect: input['multiSelect'] === true || input['multi_select'] === true,
     }],
@@ -686,8 +847,7 @@ function isAskUserQuestionTool(name: string): boolean {
 
 function normalizeAskUserQuestionInput(input: Record<string, unknown>): Record<string, unknown> {
   return {
-    ...input,
-    questions: (input['questions'] as unknown[]).map((question) => {
+    questions: (input['questions'] as unknown[]).map((question, index) => {
       if (!isRecord(question)) return question
       const rawOptions = Array.isArray(question['options'])
         ? question['options']
@@ -695,9 +855,9 @@ function normalizeAskUserQuestionInput(input: Record<string, unknown>): Record<s
           ? question['choices']
           : []
       return {
-        ...question,
         question: ensureQuestionMark(readString(question, 'question') ?? 'Please choose an option?'),
         header: shortHeader(readString(question, 'header') ?? readString(question, 'question') ?? 'Question'),
+        id: questionId(question, readString(question, 'question') ?? 'question', index),
         options: normalizeAskUserOptions(rawOptions),
         multiSelect: question['multiSelect'] === true || question['multi_select'] === true,
       }
@@ -716,6 +876,23 @@ function normalizeAskUserOptions(rawOptions: unknown[]): { label: string; descri
     }
     return { label: `Option ${index + 1}`, description: String(option) }
   })
+}
+
+function questionId(record: Record<string, unknown>, fallback: string, index: number): string {
+  const explicit = readString(record, 'id') ?? readString(record, 'key') ?? readString(record, 'name')
+  return toSnakeId(explicit ?? fallback, `question_${index + 1}`)
+}
+
+function toSnakeId(value: string, fallback: string): string {
+  const id = value
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/gu, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, '_')
+    .replace(/^_+|_+$/gu, '')
+    .replace(/_{2,}/gu, '_')
+    .slice(0, 64)
+  return id || fallback
 }
 
 function readString(record: Record<string, unknown>, key: string): string | undefined {
