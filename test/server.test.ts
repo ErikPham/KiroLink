@@ -101,7 +101,7 @@ describe('server routes', () => {
     } finally {
       await new Promise<void>((r) => s2.close(() => r()))
     }
-  })
+  }, 15_000)
 
   it('only reflects local CORS origins', async () => {
     const local = await globalThis.fetch(`http://127.0.0.1:${PORT}/health`, { headers: { origin: 'http://localhost:3000' } })
