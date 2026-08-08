@@ -1,85 +1,106 @@
-import { parseArgs } from 'node:util'
-import { createKiroProxyServer } from './server'
-import { assertSafeBind, readPort, readPositiveInteger } from './config'
+/**
+ * Public library entry point.
+ *
+ * The package previously exposed only a `bin`, so the perfectly reasonable
+ * embeddable API was unreachable from code. These are the supported exports;
+ * anything not re-exported here is internal and may change.
+ */
 
-const DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024
+export { createKiroLink, type KiroLinkApp, type KiroLinkOverrides } from './app'
 
-const { values } = parseArgs({
-  options: {
-    port: { type: 'string', short: 'p', default: process.env['KIRO_PROXY_PORT'] ?? '4119' },
-    host: { type: 'string', default: process.env['KIRO_PROXY_HOST'] ?? '127.0.0.1' },
-    quiet: { type: 'boolean', short: 'q', default: false },
-    verbose: { type: 'boolean', short: 'v', default: false },
-    'max-concurrent': { type: 'string', default: process.env['KIRO_PROXY_MAX_CONCURRENT'] ?? '2' },
-    delay: { type: 'string', default: process.env['KIRO_PROXY_DELAY_MS'] ?? '200' },
-    'api-key': { type: 'string', default: process.env['KIRO_PROXY_API_KEY'] },
-    help: { type: 'boolean', short: 'h', default: false },
-  },
-  strict: true,
-})
+export {
+  assertSafeBind,
+  assertUpstreamConfig,
+  describeUpstream,
+  isLocalHost,
+  parseAuthMode,
+  type ClientIdentityConfig,
+  type CreditsConfig,
+  type DiagnosticsConfig,
+  type KiroLinkConfig,
+  type LimitsConfig,
+  type ServerConfig,
+  type ThrottleConfig,
+  type TranslationConfig,
+  type UpstreamAuthMode,
+  type UpstreamConfig,
+} from './config/config'
 
-if (values.help) {
-  process.stdout.write(`kirolink — Anthropic-compatible proxy backed by Kiro API
+export {
+  defaultUserConfigPath,
+  loadConfig,
+  type AuthSources,
+  type CliOverrides,
+  type Env,
+  type LoadConfigResult,
+  type StoredAuthSettings,
+} from './config/env'
 
-Usage: kirolink [options]
+export {
+  buildUserConfigToSave,
+  loadUserConfig,
+  normalizeUserConfig,
+  saveUserConfig,
+  type UserConfig,
+} from './config/user-config'
 
-Options:
-  -p, --port <port>           Listen port (default: 4119)
-      --host <host>           Listen host (default: 127.0.0.1)
-  -q, --quiet                 Hide request traces
-  -v, --verbose               Show debug logs (token refresh, retries, payload info)
-      --max-concurrent <n>    Max concurrent Kiro API calls (default: 2)
-      --delay <ms>            Delay between queued requests (default: 200)
-      --api-key <key>         Require API key for clients
-  -h, --help                  Show this help
+export { listModels, normalizeModelId, type ModelDescriptor } from './domain/models'
 
-Environment:
-  KIRO_PROXY_PORT, KIRO_PROXY_HOST, KIRO_PROXY_API_KEY,
-  KIRO_PROXY_MAX_CONCURRENT, KIRO_PROXY_DELAY_MS,
-  KIRO_PROXY_MAX_BODY_BYTES, KIRO_PROXY_API_URL
+export type {
+  KiroAssistantResponseMessage,
+  KiroHistoryEntry,
+  KiroImageBlock,
+  KiroPayload,
+  KiroRequest,
+  KiroStreamEvent,
+  KiroToolResult,
+  KiroToolUse,
+  KiroUserInputMessage,
+  KiroUserInputMessageContext,
+} from './domain/types'
 
-Claude Code usage:
-  kirolink &
-  ANTHROPIC_BASE_URL=http://127.0.0.1:4119 ANTHROPIC_AUTH_TOKEN=dummy claude
-`)
-  process.exit(0)
-}
+export {
+  AuthenticationError,
+  InvalidRequestError,
+  KiroLinkError,
+  MalformedBodyError,
+  NotFoundError,
+  PayloadTooLargeError,
+  RequestAbortedError,
+  RuntimeApiError,
+  anthropicContextWindowErrorBody,
+  isContextWindowOverflow,
+  openAIContextWindowErrorBody,
+  type ApiErrorType,
+} from './errors'
 
-try {
-  const port = readPort(values.port, 4119)
-  const host = values.host!
-  const quiet = values.quiet!
-  const verbose = values.verbose!
-  const maxConcurrent = readPositiveInteger(values['max-concurrent'], 2, 'max-concurrent')
-  const delayMs = readPositiveInteger(values.delay, 200, 'delay')
-  const apiKey = values['api-key']
-  const maxBodyBytes = readPositiveInteger(process.env['KIRO_PROXY_MAX_BODY_BYTES'], DEFAULT_MAX_BODY_BYTES, 'KIRO_PROXY_MAX_BODY_BYTES')
+export { createKiroProxyServer, type ServerDeps } from './http/server'
 
-  assertSafeBind({ host, apiKey })
+export {
+  createAuthProvider,
+  loadKiroToken,
+  type AuthProvider,
+  type KiroAuth,
+  type KiroToken,
+  type TokenSource,
+} from './kiro/auth'
+export { readSecretStoreToken, type SecretStoreOptions } from './kiro/secret-store'
+export type { KiroClient } from './kiro/client'
+export { createHttpKiroClient, type HttpKiroClientDeps } from './kiro/http-client'
+export { isAllowedKiroApiHost, resolveKiroApiUrl } from './kiro/endpoint'
+export { parseEventStream } from './kiro/stream'
+export { createThrottle, type Throttle } from './kiro/throttle'
+export {
+  createUsageService,
+  formatUsageLine,
+  summarizeUsageResponse,
+  type KiroUsageSummary,
+  type UsageService,
+} from './kiro/usage'
 
-  const server = createKiroProxyServer({ port, host, quiet, verbose, maxConcurrent, delayMs, apiKey, maxBodyBytes })
+export { createLogger, createNullLogger, type LogFields, type Logger, type LogLevel } from './logging/logger'
 
-  server.on('error', (error: NodeJS.ErrnoException) => {
-    if (error.code === 'EADDRINUSE') {
-      const nextPort = port + 1
-      process.stderr.write(`Port ${port} in use, trying ${nextPort}...\n`)
-      server.listen(nextPort, host, () => {
-        process.stdout.write(`kirolink listening on http://${host}:${nextPort}\n`)
-      })
-    } else {
-      process.stderr.write(`${error.message}\n`)
-      process.exitCode = 1
-    }
-  })
-
-  server.listen(port, host, () => {
-    process.stdout.write(`kiro-proxy listening on http://${host}:${port}\n`)
-  })
-
-  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-    process.once(signal, () => server.close(() => process.exit(0)))
-  }
-} catch (error) {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
-  process.exitCode = 1
-}
+export type { ProtocolAdapter, ResponseWriter } from './protocol/adapter'
+export { createAdapters, type AdapterSet } from './protocol/registry'
+export type { AnthropicRequest, AnthropicResponse } from './protocol/anthropic/types'
+export type { OpenAICompletion, OpenAIRequest } from './protocol/openai/types'

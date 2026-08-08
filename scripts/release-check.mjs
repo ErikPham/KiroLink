@@ -7,6 +7,7 @@ function bin(name) {
 
 const steps = [
   [bin('pnpm'), ['typecheck']],
+  [bin('pnpm'), ['lint']],
   [bin('pnpm'), ['test']],
   [bin('pnpm'), ['build']],
   [bin('npm'), ['pack', '--dry-run']],

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oxc-project/oxc/main/npm/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "promise"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "warn"
+  },
+  "rules": {
+    "eqeqeq": "error",
+    "no-console": "error",
+    "typescript/consistent-type-imports": "error",
+    "typescript/no-explicit-any": "error",
+    "typescript/no-non-null-assertion": "off",
+    "unicorn/prefer-node-protocol": "error",
+    "unicorn/no-null": "off",
+    "unicorn/no-await-expression-member": "off",
+    // Retries, backoff, and framed stream reads are sequential by nature;
+    // parallelizing them would be incorrect, not faster.
+    "no-await-in-loop": "off",
+    // Mutating a local array built for a log line is intentional.
+    "unicorn/no-array-sort": "off",
+    // Helpers scoped to a describe block are deliberately local.
+    "unicorn/consistent-function-scoping": "off"
+  },
+  "overrides": [
+    {
+      "files": ["test/**"],
+      "rules": {
+        "typescript/no-explicit-any": "off",
+        "no-console": "off"
+      }
+    }
+  ],
+  "ignorePatterns": ["dist", "node_modules", "scripts", "coverage"]
+}
